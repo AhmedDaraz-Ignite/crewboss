@@ -1,0 +1,162 @@
+#!/bin/bash
+# crewboss: spawn isolated agent sessions in worktrees and drive them from herdr.
+set -u
+
+CB_HOME=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$CB_HOME/lib/naming.sh"
+. "$CB_HOME/lib/tree.sh"
+. "$CB_HOME/lib/pane.sh"
+. "$CB_HOME/lib/agent.sh"
+. "$CB_HOME/lib/registry.sh"
+
+usage() {
+  cat <<'EOF'
+crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herdr
+
+  crewboss spawn <task...>   [--in tab|space|split] [--agent KIND] [--branch NAME]
+  crewboss list
+  crewboss send  <name> <text...>
+  crewboss wait  <name>            block (zero tokens) until the crew reports done, then print its reply
+  crewboss read  <name> [lines]
+  crewboss focus <name>            jump herdr to that crew's pane
+  crewboss close <name>            close the pane; worktree and conversation are kept
+  crewboss open  <name>            reopen the pane and resume the conversation
+  crewboss remove <name> [-f]      full teardown: pane, worktree, registry entry
+
+The branch is derived from the task text: a Jira-style ticket key plus the first words become
+<prefix>-ABC-123-short-description. No ticket means <prefix>-<slug>. --branch overrides.
+The prefix comes from CB_PREFIX (default: your git user.name, lowercased).
+EOF
+}
+
+die() { echo "crewboss: $*" >&2; exit 1; }
+
+require_crew() {
+  cb_reg_get "$1" >/dev/null 2>&1 || die "no crew named '$1' (crewboss list)"
+}
+
+do_spawn() {
+  local placement=tab kind=claude branch="" task=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --in) placement=$2; shift 2 ;;
+      --agent) kind=$2; shift 2 ;;
+      --branch) branch=$2; shift 2 ;;
+      *) task="$task${task:+ }$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "spawn needs a task"
+
+  branch=$(cb_branch "$task" "$branch") || die "could not derive a branch from the task text"
+  local name
+  name=$(cb_name "$task")
+  cb_reg_get "$name" >/dev/null 2>&1 && die "crew '$name' already exists (send, open, or remove it)"
+
+  local tree pane token
+  tree=$(cb_tree_create "$branch") || die "worktree creation failed for $branch"
+  pane=$(cb_pane_create "$placement" "$tree" "$name") || die "could not create a herdr pane"
+  cb_agent_start "$name" "$kind" "$pane" fresh || die "agent failed to start"
+  token=$(cb_agent_prompt "$name" "$task") || die "could not send the task"
+
+  cb_reg_put "$name" "$(jq -n --arg b "$branch" --arg p "$tree" --arg pane "$pane" \
+    --arg k "$kind" --arg pl "$placement" --arg t "$token" \
+    '{branch: $b, path: $p, pane: $pane, agent: $k, placement: $pl, token: $t, status: "open"}')"
+
+  echo "spawned $name  branch=$branch  pane=$pane"
+  echo "watch it in herdr, or: crewboss wait $name"
+}
+
+do_list() {
+  cb_reg_init
+  local n state
+  printf '%-20s %-8s %-45s %s\n' NAME STATE BRANCH PANE
+  for n in $(cb_reg_names); do
+    if [ "$(cb_reg_field "$n" status)" = closed ]; then
+      state=closed
+    else
+      state=$(cb_agent_state "$n"); state=${state:-unknown}
+    fi
+    printf '%-20s %-8s %-45s %s\n' "$n" "$state" "$(cb_reg_field "$n" branch)" "$(cb_reg_field "$n" pane)"
+  done
+}
+
+do_send() {
+  local name=$1; shift
+  require_crew "$name"
+  [ "$(cb_reg_field "$name" status)" = open ] || die "'$name' is closed (crewboss open $name)"
+  [ $# -gt 0 ] || die "send needs text"
+  local token
+  token=$(cb_agent_prompt "$name" "$*") || die "could not send"
+  cb_reg_put "$name" "$(jq -n --arg t "$token" '{token: $t}')"
+  echo "sent; crewboss wait $name"
+}
+
+do_wait() {
+  local name=$1 pane token
+  require_crew "$name"
+  pane=$(cb_reg_field "$name" pane)
+  token=$(cb_reg_field "$name" token)
+  [ -n "$token" ] || die "nothing pending for '$name' (spawn or send first)"
+  if ! cb_agent_wait "$pane" "$token"; then
+    die "'$name' has not finished (state: $(cb_agent_state "$name")); wait again or crewboss read $name"
+  fi
+  cb_reg_put "$name" '{"token": ""}'
+  cb_agent_read "$name"
+}
+
+do_read() {
+  require_crew "$1"
+  cb_agent_read "$1" "${2:-200}"
+}
+
+do_focus() {
+  require_crew "$1"
+  [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is closed (crewboss open $1)"
+  herdr agent focus "$1" >/dev/null
+}
+
+do_close() {
+  require_crew "$1"
+  [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is already closed"
+  cb_pane_close "$(cb_reg_field "$1" pane)"
+  cb_reg_put "$1" '{"status": "closed", "token": ""}'
+  echo "closed $1 (worktree and conversation kept; crewboss open $1 to resume)"
+}
+
+do_open() {
+  local name=$1 tree kind placement pane
+  require_crew "$name"
+  [ "$(cb_reg_field "$name" status)" = closed ] || die "'$name' is already open"
+  tree=$(cb_reg_field "$name" path)
+  kind=$(cb_reg_field "$name" agent)
+  placement=$(cb_reg_field "$name" placement)
+  pane=$(cb_pane_create "$placement" "$tree" "$name") || die "could not create a herdr pane"
+  cb_agent_start "$name" "$kind" "$pane" resume || die "agent failed to resume"
+  cb_reg_put "$name" "$(jq -n --arg p "$pane" '{pane: $p, status: "open", token: ""}')"
+  echo "reopened $name  pane=$pane (conversation resumed)"
+}
+
+do_remove() {
+  local name=$1 force=${2:-}
+  require_crew "$name"
+  [ "$(cb_reg_field "$name" status)" = open ] && cb_pane_close "$(cb_reg_field "$name" pane)"
+  cb_tree_remove "$(cb_reg_field "$name" branch)" "$force" || die "worktree removal failed (dirty? add -f)"
+  cb_reg_del "$name"
+  echo "removed $name"
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case $cmd in
+  spawn)  do_spawn "$@" ;;
+  list)   do_list ;;
+  send)   [ $# -ge 2 ] || die "usage: crewboss send <name> <text...>"; do_send "$@" ;;
+  wait)   [ $# -ge 1 ] || die "usage: crewboss wait <name>"; do_wait "$1" ;;
+  read)   [ $# -ge 1 ] || die "usage: crewboss read <name> [lines]"; do_read "$@" ;;
+  focus)  [ $# -ge 1 ] || die "usage: crewboss focus <name>"; do_focus "$1" ;;
+  close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
+  open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
+  remove) [ $# -ge 1 ] || die "usage: crewboss remove <name> [-f]"; do_remove "$@" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 2 ;;
+esac
