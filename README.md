@@ -1,50 +1,63 @@
 # crewboss
 
-Spawn isolated agent sessions in dedicated git worktrees and drive them from your
-current session - or from your own terminal.
+crewboss lets one AI agent (or you) start other AI agents and give them tasks.
 
-One command spawns a crew: worktree created on a convention-correct branch, pane
-opened in [herdr](https://herdr.dev), agent started (Claude Code, Codex, or any of
-herdr's supported agents), task delivered. You watch and click between crews in herdr
-itself. Close any crew and reopen it later with its conversation intact.
+Each helper agent is called a **crew**. Every crew gets:
+
+- its own copy of the repo (a git worktree), so crews never break each other's files
+- its own terminal window inside [herdr](https://herdr.dev), so you can watch it work
+- its own task, sent as plain text
+
+You can close a crew and open it again later. It remembers the whole conversation.
+
+## Quick example
 
 ```bash
 crewboss spawn "ABC-123 make the footer sticky"
-crewboss wait ABC-123          # blocks until the crew reports done, prints its reply
+crewboss wait ABC-123          # waits until the crew says it is done, then prints its answer
 crewboss send ABC-123 "also fix the mobile layout"
-crewboss close ABC-123         # pane gone; worktree and conversation kept
-crewboss open  ABC-123         # resume right where it left off
-crewboss remove ABC-123 -f     # full teardown
+crewboss close ABC-123         # closes the window; files and conversation are kept
+crewboss open  ABC-123         # opens it again, right where it stopped
+crewboss remove ABC-123 -f     # deletes everything for this crew
 ```
 
+That is the whole idea: `spawn` a crew, `wait` for it, `send` more work, `close` when done.
+
 ## Install as an agent skill
+
+This teaches your AI agent (Claude Code, Codex, and others) how to use crewboss:
 
 ```bash
 npx skills add AhmedDaraz-Ignite/crewboss
 ```
 
-Target a specific agent (`npx skills add AhmedDaraz-Ignite/crewboss --agent claude-code`)
-or all of them (`--agent '*'`). The skill teaches the installed agent the interface and
-the orchestration rules (zero-token waiting, snapshot reads, close-over-remove).
+To install for one agent only:
 
-## Install for direct shell use
+```bash
+npx skills add AhmedDaraz-Ignite/crewboss --agent claude-code
+```
+
+Or for all agents on your machine: `--agent '*'`.
+
+## Install for your own shell
+
+If you want to type the commands yourself:
 
 ```bash
 git clone https://github.com/AhmedDaraz-Ignite/crewboss
-ln -s "$PWD/crewboss/scripts/crewboss" ~/bin/crewboss   # or anywhere on PATH
+ln -s "$PWD/crewboss/scripts/crewboss" ~/bin/crewboss   # or any folder on your PATH
 ```
 
-## Requirements
+## What you need first
 
-- [herdr](https://herdr.dev) - terminal multiplexer; owns panes and agent processes.
-  Run `crewboss` from inside herdr for `tab` and `split` placement.
-- [worktrunk](https://worktrunk.dev) (`wt`) - owns worktree creation, the
-  branch-to-path template, and post-switch hooks.
+- [herdr](https://herdr.dev) - a terminal app that manages windows (panes) and agents.
+  Run `crewboss` from inside herdr.
+- [worktrunk](https://worktrunk.dev) (`wt`) - a tool that creates git worktrees.
 - `jq`, `bash`, `git`.
 
-## How names are derived
+## How crewboss picks names
 
-You give the task, crewboss derives the rest:
+You only type the task. crewboss finds the crew name and branch name by itself:
 
 | You type                              | Crew name | Branch                          |
 | ------------------------------------- | --------- | ------------------------------- |
@@ -52,33 +65,42 @@ You give the task, crewboss derives the rest:
 | `spawn "profile the import job"`      | `profile-the-import-job` | `<prefix>-profile-the-import-job` |
 | `spawn --branch my-branch "..."`      | from task | `my-branch`                     |
 
-- `CB_PREFIX` sets the prefix (default: your git `user.name`, lowercased).
-- `CB_BASE` sets the base ref (default: the remote's default branch).
-- The worktree path is never computed by crewboss; it asks worktrunk, so your
-  `worktree-path` template stays the single source of truth.
+If the task starts with a ticket number (like `ABC-123`), that becomes the crew name.
+If not, the first few words of the task become the name.
 
-## Design
+Two settings you can change:
 
-A thin bash entry point plus five modules, each owning one concern:
+- `CB_PREFIX` - the word at the start of every branch name. Default: your git `user.name`, in lowercase.
+- `CB_BASE` - the branch new work starts from. Default: your repo's main branch.
 
-| Module            | Owns                                                    |
+## How it works inside
+
+crewboss is a small bash script plus five modules. Each module does one job:
+
+| Module            | Job                                                     |
 | ----------------- | ------------------------------------------------------- |
-| `lib/naming.sh`   | task text to crew name and branch (pure)                |
-| `lib/tree.sh`     | worktree create, path lookup, remove (worktrunk)        |
-| `lib/pane.sh`     | pane per placement, focus, close (herdr)                |
-| `lib/agent.sh`    | start, resume, prompt, sentinel wait, read; all timeouts |
-| `lib/registry.sh` | the crew record that makes close and reopen possible    |
+| `lib/naming.sh`   | turns task text into a crew name and a branch name      |
+| `lib/tree.sh`     | creates and removes worktrees (using worktrunk)         |
+| `lib/pane.sh`     | opens, focuses, and closes windows (using herdr)        |
+| `lib/agent.sh`    | starts the agent, sends the task, waits for the answer  |
+| `lib/registry.sh` | remembers each crew, so close and open work later       |
 
-Completion is detected with a sentinel the crew prints when finished, matched by
-`herdr pane wait-output` - one blocking call, so an orchestrating agent spends zero
-tokens while waiting. Conversation resume works because the worktree keeps the files
-and the agent keys its history to the working directory (`claude --continue`).
+**How `wait` knows the crew is done:** crewboss adds one line to every task, asking
+the crew to print a secret code word when it finishes. Then it asks herdr to watch
+the crew's window for that code word. This is one single blocking call. So if an AI
+agent is the one waiting, it spends zero tokens during the wait - it does not need
+to check again and again.
 
-Hardened against the races found while building it: a fresh pane rejects
-`agent start` until its shell is up (retried), and a freshly started agent can
-silently swallow its first prompt (crewboss verifies the prompt echoed and resends).
+**How `open` brings a conversation back:** the worktree keeps the files, and the
+agent saves its chat history per folder. So starting the agent again in the same
+folder (`claude --continue`) brings the old conversation back.
 
-State lives in `~/.local/state/crewboss/crew.json`.
+crewboss also protects you from two timing bugs we hit while building it: a brand
+new window can refuse to start an agent for a few seconds (crewboss retries), and a
+brand new agent can lose the first message you send it (crewboss checks the message
+arrived and sends it again if not).
+
+Crew records live in `~/.local/state/crewboss/crew.json`.
 
 ## License
 
