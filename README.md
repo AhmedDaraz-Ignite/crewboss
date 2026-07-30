@@ -39,6 +39,30 @@ npx skills add AhmedDaraz-Ignite/crewboss --agent claude-code
 
 Or for all agents on your machine: `--agent '*'`.
 
+## How your agent knows when to use crewboss
+
+This follows the standard agent-skills protocol, so it works the same in any agent
+that supports skills:
+
+1. At the start of a session, your agent reads only the skill's one-line description.
+2. When you ask for something that matches it - "spawn a crew", "delegate this to a
+   parallel session", "work on these three tickets in parallel", or simply the word
+   "crewboss" - the agent loads the full `SKILL.md` and runs the bundled script.
+3. Normal tasks ("fix the footer") still run in the current session. Nothing is
+   delegated unless you ask for it.
+
+If you want your agent to delegate every task by default, add one line to your
+project's `AGENTS.md` (or `CLAUDE.md`):
+
+> For every implementation task, spawn a crew with crewboss and orchestrate from
+> this session instead of editing files directly.
+
+The tool stays generic. When to delegate is your project's policy, not crewboss's.
+
+One requirement: the session that runs crewboss must itself be inside a
+[herdr](https://herdr.dev) pane, because new crews are opened as herdr tabs or splits
+next to it.
+
 ## Install for your own shell
 
 If you want to type the commands yourself:
