@@ -13,6 +13,8 @@ CB_HOME=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CB_HOME/lib/agent.sh"
 # shellcheck source=scripts/lib/registry.sh
 . "$CB_HOME/lib/registry.sh"
+# shellcheck source=scripts/lib/events.sh
+. "$CB_HOME/lib/events.sh"
 
 usage() {
   cat <<'EOF'
@@ -179,6 +181,10 @@ do_remove() {
   echo "removed $name"
 }
 
+do_emit() {
+  cb_event_emit "$@" || die "could not append crew event"
+}
+
 cmd=${1:-help}
 [ $# -gt 0 ] && shift
 case $cmd in
@@ -191,6 +197,7 @@ case $cmd in
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
   open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
   remove) do_remove "$@" ;;
+  emit)   [ $# -eq 5 ] || die "invalid crew event"; do_emit "$@" ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;
 esac
