@@ -23,7 +23,7 @@ crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herd
   crewboss spawn <task...>   [--in tab|space|split] [--agent KIND] [--branch NAME]
   crewboss list                   print NAME ENDPOINT TASK BRANCH SUMMARY
   crewboss send  <name> <text...>
-  crewboss wait  <name>...         print the first selected blocked or done event
+  crewboss wait  <name>...         print the oldest current event for the selected crews
   crewboss read  <name> [lines]
   crewboss focus <name>            jump herdr to that crew's pane
   crewboss close <name>            close the pane; worktree and conversation are kept
@@ -33,9 +33,10 @@ crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herd
 remove refuses dirty or locally unpushed work. -f is explicit discard authority.
 crewboss verifies the live pane before closing it and never spawns in the primary checkout.
 
-Each crew appends blocked and done events to one shared append-only log. CrewBoss reads them
-in strict FIFO insertion order: the oldest inserted event first. In Phase 1, wait is the
-foreground listener. It has no task timeout or background watcher, and it does not poll screens.
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are blocked and done. FIFO means the oldest inserted event first. In Phase 1, wait
+is the foreground listener. It has no task timeout or background watcher, and it does not poll
+screens. It returns the oldest current event for the selected crews.
 
 The first output line is "NAME blocked" or "NAME done". The exact payload follows.
 The payload can use more than one line.

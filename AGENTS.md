@@ -42,7 +42,7 @@ Six modules, one dispatcher, sourced not exec'd:
 
 | File | Owns |
 | --- | --- |
-| `scripts/crewboss` | argument parsing and the `do_*` command bodies. No external tool calls of its own except `herdr agent focus` |
+| `scripts/crewboss` | argument parsing, public command flow, and output formatting |
 | `lib/naming.sh` | task text to crew name and branch name |
 | `lib/tree.sh` | worktree lifecycle, delegated to `wt` (worktrunk) |
 | `lib/pane.sh` | pane lifecycle, delegated to `herdr` |
@@ -69,13 +69,14 @@ The internal `emit` command also takes stored crew and run identities. Preserve 
 
 ### Event supervision
 
-Crews append `blocked` and `done` events to one shared append-only log. CrewBoss reads events in
-strict FIFO insertion order and acts. FIFO means the oldest inserted event first. The event append
-is the notification. CrewBoss does not use screen text as a completion signal.
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are `blocked` and `done`. FIFO means the oldest inserted event first. The event append is
+the notification. CrewBoss does not use screen text as a completion signal.
 
-`wait A B C` is the Phase 1 foreground listener. It returns the first selected event. The first
-output line is `NAME blocked` or `NAME done`. The exact payload follows and can use more than one
-line. There is no task timeout or background watcher. It does not poll screens.
+`wait A B C` is the Phase 1 foreground listener. It returns the oldest current event for the
+selected crews. The first output line is `NAME blocked` or `NAME done`. The exact payload follows
+and can use more than one line. There is no task timeout or background watcher. It does not poll
+screens.
 
 Delivery is at least once after a crash. An event may be printed twice, but an appended event must
 not be lost. `events.jsonl` remains the source. `event-state.json` is only a cursor and pending

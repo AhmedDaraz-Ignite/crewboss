@@ -19,8 +19,9 @@ crewboss spawn "ABC-125 add an export button"
 crewboss wait ABC-123 ABC-124 ABC-125
 ```
 
-`wait` returns the first selected `blocked` or `done` event. The first line is the crew
-name and event kind. The exact payload follows and can use more than one line:
+`wait` returns the oldest current event for the selected crews. It can be `blocked` or
+`done`. The first line is the crew name and event kind. The exact payload follows and
+can use more than one line:
 
 ```text
 ABC-124 blocked
@@ -38,7 +39,8 @@ crewboss remove ABC-123 -f     # discards local work and deletes everything for 
 ```
 
 For a `done` event, act on the final answer. For example, review the files or report the result.
-Spawn all crews first. Then use one blocking `wait A B C` call.
+When several crews are planned, spawn them all before waiting. Then use one blocking
+`wait A B C` call. `wait A` also works for one crew.
 
 ## Install as an agent skill
 
@@ -129,10 +131,10 @@ crewboss is a small bash script plus six modules. Each module does one job:
 | `lib/registry.sh` | remembers each crew and its current task state           |
 | `lib/events.sh`   | appends and reads crew events                            |
 
-Every crew appends `blocked` and `done` events to one shared append-only log. CrewBoss
-reads events in strict FIFO insertion order. FIFO means the oldest inserted event first.
-It then acts on the event. `wait NAME...` returns the first event for the selected crews.
-Events for other crews stay pending.
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are `blocked` and `done`. FIFO means the oldest inserted event first.
+`wait NAME...` returns the oldest current event for the selected crews. Events for other
+crews stay pending.
 
 In Phase 1, `wait` is the foreground listener. It has no task timeout or background
 watcher. It blocks in one shell process and does not poll crew screens. `read` only
@@ -150,7 +152,7 @@ can report `agent_pane_busy`, so CrewBoss retries the agent start. A new agent c
 its first prompt, so CrewBoss checks for the unique CrewBoss run ID and tries prompt
 delivery up to five times.
 
-State lives in `~/.local/state/crewboss/`:
+State lives under `$CB_STATE_DIR`. Its default is `~/.local/state/crewboss/`:
 
 | File | Contents |
 | --- | --- |

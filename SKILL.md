@@ -35,7 +35,7 @@ Never type a pane ID, path, or timeout:
 "$CREWBOSS" spawn <task...>    # start a crew on a task (--in tab|space|split, --agent KIND, --branch NAME)
 "$CREWBOSS" list               # columns: NAME ENDPOINT TASK BRANCH SUMMARY
 "$CREWBOSS" send  <name> <text...>
-"$CREWBOSS" wait  <name>...    # first selected blocked or done event
+"$CREWBOSS" wait  <name>...    # oldest current event for the selected crews
 "$CREWBOSS" read  <name> [lines]
 "$CREWBOSS" focus <name>       # jump herdr to that crew's pane
 "$CREWBOSS" close <name>       # pane goes away; worktree and conversation are kept
@@ -58,8 +58,9 @@ in separate worktrees.
 
 ## Rules for the orchestrating agent
 
-1. **Spawn all crews before waiting.** Then issue one blocking call such as
-   `wait A B C`. Do not start one crew and wait before starting the others.
+1. **Spawn planned crews before waiting.** When several crews are planned, spawn them
+   all before waiting. Then issue one blocking call such as `wait A B C`. A one-name
+   call such as `wait A` is also valid.
 2. **Handle `blocked`.** Relay the exact question to the user. Use `send NAME ANSWER`
    to give the answer to the crew. Then wait again.
 3. **Handle `done`.** Act on the final answer. Review, integrate, or report it as the
@@ -80,9 +81,10 @@ in separate worktrees.
 
 ## Events and state
 
-Every crew appends `blocked` and `done` events to one shared append-only log. CrewBoss
-reads them in strict FIFO insertion order and acts. FIFO means the oldest inserted event
-first. Events for crews outside the current `wait` stay pending.
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are `blocked` and `done`. FIFO means the oldest inserted event first.
+`wait` returns the oldest current event for the selected crews. Events for crews outside
+the current `wait` stay pending.
 
 The first output line is the crew name and event kind. The exact payload follows. It can
 use more than one line. A simple blocked event looks like this:

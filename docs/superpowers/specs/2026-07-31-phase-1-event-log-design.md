@@ -4,7 +4,10 @@
 
 CrewBoss must supervise several crews through events.
 
-A crew must not notify CrewBoss by changing screen text. It must append an event to one shared append-only log. CrewBoss reads events in strict FIFO insertion order and acts. FIFO means the oldest inserted event first.
+A crew must not notify CrewBoss by changing screen text.
+
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+FIFO means the oldest inserted event first.
 
 ## Simple flow
 
@@ -95,7 +98,7 @@ The cursor and pending map are written together by replacing one temporary file.
 2. Process every line in global sequence order.
 3. Save an event for an unselected crew as pending.
 4. Update the crew's current task state.
-5. Return the oldest current pending event for A or B.
+5. Return the oldest current event for A or B.
 6. Remove that pending event only after its output is printed.
 
 For example:
@@ -151,6 +154,8 @@ The public wait command becomes:
 ```text
 crewboss wait <name>...
 ```
+
+It returns the oldest current event for the selected crews.
 
 The first output line is the crew name and event kind. The exact payload follows and can use more than one line. A simple blocked event looks like this:
 
