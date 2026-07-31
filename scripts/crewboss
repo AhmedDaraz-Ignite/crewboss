@@ -149,8 +149,9 @@ do_open() {
 }
 
 do_remove() {
-  [ $# -ge 1 ] && [ $# -le 2 ] ||
+  if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     die "usage: crewboss remove <name> [-f]"
+  fi
   local name=$1 force=${2:-} branch path
   [ -z "$force" ] || [ "$force" = -f ] ||
     die "usage: crewboss remove <name> [-f]"
@@ -188,8 +189,9 @@ case $cmd in
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
   open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
   remove)
-    [ $# -ge 1 ] && [ $# -le 2 ] ||
+    if [ $# -lt 1 ] || [ $# -gt 2 ]; then
       die "usage: crewboss remove <name> [-f]"
+    fi
     do_remove "$@"
     ;;
   help|--help|-h) usage ;;
