@@ -632,6 +632,54 @@ test_new_ids_keep_the_requested_prefix_and_are_unique() {
   [ "$first" != "$second" ]
 }
 
+assert_send_receipt_rejected_unchanged() {
+  local receipt=$1 status
+  cp "$CB_REG" "$TEST_TMP/receipt.before" || return 1
+  cb_reg_send_finish crew "$receipt" failure >/dev/null 2>&1
+  status=$?
+  assert_eq 1 "$status" || return 1
+  cmp -s "$TEST_TMP/receipt.before" "$CB_REG"
+}
+
+test_send_receipt_binds_the_exact_prepared_transaction() {
+  setup_registry
+  cb_reg_put crew '{"status":"open","crew_id":"crew-current","run_id":"run-old",
+    "latest_prompt":"old prompt","task_status":"blocked","blocked":true,
+    "message":"old question","last_event_seq":7,"kept":"value"}' || return 1
+
+  cb_reg_send_begin crew crew-candidate run-new "new prompt" || return 1
+  local receipt=$CB_REG_SEND_RECEIPT
+
+  jq -e --arg name crew '
+    keys == ["baseline_last_event_seq","before","crew_id","name","prepared","run_id"] and
+    .name == $name and .crew_id == "crew-current" and .run_id == "run-new" and
+    .baseline_last_event_seq == 7 and (.prepared.latest_prompt | type) == "string" and
+    .prepared == (.before + {
+      crew_id: .crew_id, run_id: .run_id, latest_prompt: .prepared.latest_prompt
+    })
+  ' <<< "$receipt" >/dev/null
+}
+
+test_forged_send_receipts_change_nothing() {
+  setup_registry
+  cb_reg_put crew '{"status":"open","crew_id":"crew-current","run_id":"run-old",
+    "latest_prompt":"old prompt","task_status":"blocked","blocked":true,
+    "message":"old question","last_event_seq":7,"kept":"value"}' || return 1
+  cb_reg_send_begin crew crew-candidate run-new "new prompt" || return 1
+  local receipt=$CB_REG_SEND_RECEIPT forged
+  local -a forged_receipts
+  forged_receipts=()
+  forged_receipts+=("$(jq -c '.name = "other"' <<< "$receipt")")
+  forged_receipts+=("$(jq -c '.baseline_last_event_seq = 8' <<< "$receipt")")
+  forged_receipts+=("$(jq -c '.prepared.crew_id = "crew-other"' <<< "$receipt")")
+  forged_receipts+=("$(jq -c '.before = {status:"open",attacker:true}' <<< "$receipt")")
+  forged_receipts+=("$receipt"$'\n'"$receipt")
+
+  for forged in "${forged_receipts[@]}"; do
+    assert_send_receipt_rejected_unchanged "$forged" || return 1
+  done
+}
+
 run_test "concurrent registry writes keep every field" test_concurrent_puts_keep_every_field
 run_test "a current blocked event updates task state" test_current_blocked_event_updates_task_state
 run_test "replaying an event keeps the same task state" test_replaying_an_event_keeps_the_same_state
@@ -639,6 +687,10 @@ run_test "an old crew identity is stale without changing state" test_old_crew_id
 run_test "an old run identity is stale without changing state" test_old_run_identity_returns_stale_without_changing_the_record
 run_test "replace and endpoint state keep only current record fields" test_replace_and_endpoint_state_write_atomically
 run_test "new registry identities use unique requested prefixes" test_new_ids_keep_the_requested_prefix_and_are_unique
+run_test "send receipts bind the exact prepared transaction" \
+  test_send_receipt_binds_the_exact_prepared_transaction
+run_test "forged send receipts change nothing" \
+  test_forged_send_receipts_change_nothing
 run_test "a same-shell background owner uses its worker pid" test_background_owner_uses_worker_pid
 run_test "forced equal tickets enter in tuple order" test_equal_tickets_enter_in_tuple_order
 run_test "a process killed while choosing does not block a successor" test_dead_chooser_does_not_block_a_successor

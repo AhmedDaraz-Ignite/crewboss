@@ -115,6 +115,46 @@ assert_corrupt_checkpoint_fails_unchanged() {
   cmp -s "$TEST_TMP/crew.before" "$CB_REG"
 }
 
+write_fake_wait_watchdog() {
+  local path=$1
+  cat > "$path" <<'WATCHDOG'
+#!/bin/bash
+set -u
+output=$1
+shift
+marker="$output.timeout"
+rm -f "$marker"
+"$@" > "$output" &
+wait_pid=$!
+(
+  ticks=0
+  while kill -0 "$wait_pid" 2>/dev/null; do
+    ticks=$((ticks + 1))
+    if [ "$ticks" -ge 500 ]; then
+      : > "$marker"
+      kill -TERM "$wait_pid" 2>/dev/null || true
+      /bin/sleep 0.1
+      if kill -0 "$wait_pid" 2>/dev/null; then
+        kill -KILL "$wait_pid" 2>/dev/null || true
+      fi
+      exit 0
+    fi
+    /bin/sleep 0.01
+  done
+) &
+watchdog_pid=$!
+wait "$wait_pid" 2>/dev/null
+wait_status=$?
+wait "$watchdog_pid" 2>/dev/null || true
+if [ -e "$marker" ]; then
+  printf 'fake Herdr wait timed out\n' >&2
+  exit 124
+fi
+exit "$wait_status"
+WATCHDOG
+  chmod +x "$path"
+}
+
 test_spawn_persists_identity_before_prompt_and_keeps_an_immediate_event() {
   local fixture bin state tree output status
   fixture=$(mktemp -d)
@@ -163,7 +203,91 @@ case "$1 $2" in
     printf '%s\n' "$4" > "$TEST_PROMPT"
     printf '%s\n' "$4" | grep -Fq "CrewBoss run id: $run_id" || exit 73
     "$CREWBOSS" emit ABC-123 "$crew_id" "$run_id" done "immediate result" || exit 74
-    "$CREWBOSS" wait ABC-123 > "$TEST_IMMEDIATE_OUTPUT" || exit 75
+    "$TEST_WAIT_BOUNDED" "$TEST_IMMEDIATE_OUTPUT" \
+      "$CREWBOSS" wait ABC-123 || exit 75
+    ;;
+  "agent read")
+    sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT"
+    ;;
+  *) exit 2 ;;
+esac
+HERDR
+
+  cat > "$bin/sleep" <<'SLEEP'
+#!/bin/bash
+exit 0
+SLEEP
+  chmod +x "$bin/herdr" "$bin/sleep" "$bin/wt"
+  write_fake_wait_watchdog "$bin/wait-bounded"
+
+  output=$(PATH="$bin:$PATH" CB_STATE_DIR="$state" CB_PREFIX=test \
+    HERDR_WORKSPACE_ID=w1 TEST_TREE="$tree" TEST_PROMPT="$fixture/prompt" \
+    TEST_IMMEDIATE_OUTPUT="$fixture/immediate.out" CREWBOSS="$CREWBOSS" \
+    TEST_WAIT_BOUNDED="$bin/wait-bounded" \
+    "$CREWBOSS" spawn "ABC-123 immediate task" 2>&1)
+  status=$?
+
+  assert_eq 0 "$status" || return 1
+  assert_contains "$output" "spawned ABC-123" || return 1
+  assert_eq $'ABC-123 done\nimmediate result' \
+    "$(cat "$fixture/immediate.out")" || return 1
+  jq -e '.["ABC-123"] as $crew |
+    $crew.task == "ABC-123 immediate task" and
+    $crew.latest_prompt == "ABC-123 immediate task" and
+    $crew.task_status == "done" and $crew.blocked == false and
+    $crew.message == "immediate result" and $crew.last_event_seq == 1
+  ' "$state/crew.json" >/dev/null
+}
+
+test_relative_state_dir_is_absolute_in_the_delivered_event_command() {
+  local fixture orchestrator orchestrator_physical bin tree output status
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' RETURN
+  orchestrator="$fixture/orchestrator"
+  bin="$fixture/bin"
+  tree="$fixture/tree"
+  mkdir -p "$orchestrator" "$bin"
+  orchestrator_physical=$(cd "$orchestrator" && pwd -P) || return 1
+
+  cat > "$bin/wt" <<'WT'
+#!/bin/bash
+case $1 in
+  list)
+    if [ -f "$TEST_TREE/.created" ]; then
+      jq -cn --arg path "$TEST_TREE" '[{branch:"test-ABC-124-relative-state",path:$path}]'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  switch)
+    mkdir -p "$TEST_TREE"
+    : > "$TEST_TREE/.created"
+    ;;
+  *) exit 2 ;;
+esac
+WT
+
+  cat > "$bin/herdr" <<'HERDR'
+#!/bin/bash
+case "$1 $2" in
+  "tab create")
+    printf '{"result":{"root_pane":{"pane_id":"w1:p1"}}}\n'
+    ;;
+  "agent start") ;;
+  "agent prompt")
+    printf '%s\n' "$4" > "$TEST_PROMPT"
+    awk '
+      $0 == "When the work is complete, emit the final answer before ending:" {
+        copying = 1
+        next
+      }
+      copying { print }
+    ' "$TEST_PROMPT" > "$TEST_EMIT_SCRIPT" || exit 70
+    [ -s "$TEST_EMIT_SCRIPT" ] || exit 71
+    (
+      cd "$TEST_TREE" || exit 1
+      /bin/bash "$TEST_EMIT_SCRIPT"
+    ) || exit 72
     ;;
   "agent read")
     sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT"
@@ -178,22 +302,131 @@ exit 0
 SLEEP
   chmod +x "$bin/herdr" "$bin/sleep" "$bin/wt"
 
-  output=$(PATH="$bin:$PATH" CB_STATE_DIR="$state" CB_PREFIX=test \
-    HERDR_WORKSPACE_ID=w1 TEST_TREE="$tree" TEST_PROMPT="$fixture/prompt" \
-    TEST_IMMEDIATE_OUTPUT="$fixture/immediate.out" CREWBOSS="$CREWBOSS" \
-    "$CREWBOSS" spawn "ABC-123 immediate task" 2>&1)
+  output=$(cd "$orchestrator" && PATH="$bin:$PATH" CB_STATE_DIR=state \
+    CB_PREFIX=test CB_BASE=origin/main HERDR_WORKSPACE_ID=w1 TEST_TREE="$tree" \
+    TEST_PROMPT="$fixture/prompt" TEST_EMIT_SCRIPT="$fixture/emit.sh" \
+    "$CREWBOSS" spawn "ABC-124 relative state" 2>&1)
   status=$?
 
   assert_eq 0 "$status" || return 1
-  assert_contains "$output" "spawned ABC-123" || return 1
-  assert_eq $'ABC-123 done\nimmediate result' \
-    "$(cat "$fixture/immediate.out")" || return 1
-  jq -e '.["ABC-123"] as $crew |
-    $crew.task == "ABC-123 immediate task" and
-    $crew.latest_prompt == "ABC-123 immediate task" and
+  assert_contains "$output" "spawned ABC-124" || return 1
+  assert_contains "$(cat "$fixture/prompt")" \
+    "CB_STATE_DIR=$orchestrator_physical/state " || return 1
+  jq -s -e 'length == 1 and .[0].crew == "ABC-124" and
+    .[0].kind == "done" and .[0].payload == "the final answer"' \
+    "$orchestrator/state/events.jsonl" >/dev/null || return 1
+  [ ! -e "$tree/state" ]
+}
+
+setup_failed_spawn_cli() {
+  SPAWN_FAIL_TMP=$(mktemp -d)
+  SPAWN_FAIL_BIN="$SPAWN_FAIL_TMP/bin"
+  SPAWN_FAIL_STATE="$SPAWN_FAIL_TMP/state"
+  SPAWN_FAIL_TREE="$SPAWN_FAIL_TMP/tree"
+  mkdir -p "$SPAWN_FAIL_BIN" "$SPAWN_FAIL_STATE"
+  : > "$SPAWN_FAIL_TMP/herdr.log"
+
+  cat > "$SPAWN_FAIL_BIN/wt" <<'WT'
+#!/bin/bash
+case $1 in
+  list)
+    if [ -f "$TEST_TREE/.created" ]; then
+      jq -cn --arg path "$TEST_TREE" '[{branch:"test-ABC-125-failed-delivery",path:$path}]'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  switch)
+    mkdir -p "$TEST_TREE"
+    : > "$TEST_TREE/.created"
+    ;;
+  *) exit 2 ;;
+esac
+WT
+
+  cat > "$SPAWN_FAIL_BIN/herdr" <<'HERDR'
+#!/bin/bash
+case "$1 $2" in
+  "tab create")
+    printf '{"result":{"root_pane":{"pane_id":"w1:p1"}}}\n'
+    ;;
+  "agent start") ;;
+  "agent prompt")
+    printf 'prompt\n' >> "$TEST_HERDR_LOG"
+    printf '%s\n' "$4" > "$TEST_PROMPT"
+    if [ "$TEST_FAILURE_MODE" = immediate ] && [ ! -e "$TEST_EVENT_SENT" ]; then
+      crew_id=$(jq -r '.["ABC-125"].crew_id' "$CB_STATE_DIR/crew.json") || exit 70
+      run_id=$(jq -r '.["ABC-125"].run_id' "$CB_STATE_DIR/crew.json") || exit 71
+      "$CREWBOSS" emit ABC-125 "$crew_id" "$run_id" done \
+        "event despite failed confirmation" || exit 72
+      "$TEST_WAIT_BOUNDED" "$TEST_IMMEDIATE_OUTPUT" \
+        "$CREWBOSS" wait ABC-125 || exit 73
+      : > "$TEST_EVENT_SENT"
+    fi
+    ;;
+  "agent read")
+    printf 'prompt confirmation unavailable\n'
+    ;;
+  *) exit 2 ;;
+esac
+HERDR
+
+  cat > "$SPAWN_FAIL_BIN/sleep" <<'SLEEP'
+#!/bin/bash
+exit 0
+SLEEP
+  chmod +x "$SPAWN_FAIL_BIN/herdr" "$SPAWN_FAIL_BIN/sleep" "$SPAWN_FAIL_BIN/wt"
+  write_fake_wait_watchdog "$SPAWN_FAIL_BIN/wait-bounded"
+}
+
+run_failed_spawn_cli() {
+  PATH="$SPAWN_FAIL_BIN:$PATH" CB_STATE_DIR="$SPAWN_FAIL_STATE" CB_PREFIX=test \
+    CB_BASE=origin/main HERDR_WORKSPACE_ID=w1 TEST_TREE="$SPAWN_FAIL_TREE" \
+    TEST_HERDR_LOG="$SPAWN_FAIL_TMP/herdr.log" TEST_PROMPT="$SPAWN_FAIL_TMP/prompt" \
+    TEST_FAILURE_MODE="$TEST_FAILURE_MODE" TEST_EVENT_SENT="$SPAWN_FAIL_TMP/event-sent" \
+    TEST_IMMEDIATE_OUTPUT="$SPAWN_FAIL_TMP/immediate.out" CREWBOSS="$CREWBOSS" \
+    TEST_WAIT_BOUNDED="$SPAWN_FAIL_BIN/wait-bounded" \
+    "$CREWBOSS" spawn "ABC-125 failed delivery"
+}
+
+test_failed_initial_prompt_marks_the_saved_crew_unknown() {
+  setup_failed_spawn_cli
+  trap 'rm -rf "$SPAWN_FAIL_TMP"' RETURN
+  TEST_FAILURE_MODE=ordinary
+  local output status
+
+  output=$(run_failed_spawn_cli 2>&1)
+  status=$?
+
+  assert_eq 1 "$status" || return 1
+  assert_contains "$output" "could not send the task" || return 1
+  assert_eq 5 "$(grep -c '^prompt$' "$SPAWN_FAIL_TMP/herdr.log")" || return 1
+  jq -e '.["ABC-125"] as $crew |
+    $crew.status == "open" and $crew.task_status == "unknown" and
+    $crew.blocked == false and $crew.message == "" and $crew.last_event_seq == 0 and
+    ($crew.crew_id | startswith("crew-")) and ($crew.run_id | startswith("run-"))
+  ' "$SPAWN_FAIL_STATE/crew.json" >/dev/null
+}
+
+test_failed_initial_prompt_preserves_an_applied_event() {
+  setup_failed_spawn_cli
+  trap 'rm -rf "$SPAWN_FAIL_TMP"' RETURN
+  TEST_FAILURE_MODE=immediate
+  local output status
+
+  output=$(run_failed_spawn_cli 2>&1)
+  status=$?
+
+  assert_eq 1 "$status" || return 1
+  assert_contains "$output" "could not send the task" || return 1
+  assert_eq 5 "$(grep -c '^prompt$' "$SPAWN_FAIL_TMP/herdr.log")" || return 1
+  assert_eq $'ABC-125 done\nevent despite failed confirmation' \
+    "$(cat "$SPAWN_FAIL_TMP/immediate.out")" || return 1
+  jq -e '.["ABC-125"] as $crew |
     $crew.task_status == "done" and $crew.blocked == false and
-    $crew.message == "immediate result" and $crew.last_event_seq == 1
-  ' "$state/crew.json" >/dev/null
+    $crew.message == "event despite failed confirmation" and
+    $crew.last_event_seq == 1
+  ' "$SPAWN_FAIL_STATE/crew.json" >/dev/null
 }
 
 setup_send_cli() {
@@ -229,7 +462,8 @@ case "$1 $2" in
       crew_id=$(jq -r --arg name "$TEST_CREW" '.[$name].crew_id' "$CB_STATE_DIR/crew.json") || exit 73
       run_id=$(jq -r --arg name "$TEST_CREW" '.[$name].run_id' "$CB_STATE_DIR/crew.json") || exit 74
       "$CREWBOSS" emit "$TEST_CREW" "$crew_id" "$run_id" done "immediate follow-up" || exit 75
-      "$CREWBOSS" wait "$TEST_CREW" > "$TEST_IMMEDIATE_OUTPUT" || exit 76
+      "$TEST_WAIT_BOUNDED" "$TEST_IMMEDIATE_OUTPUT" \
+        "$CREWBOSS" wait "$TEST_CREW" || exit 76
     fi
     ;;
   "agent read")
@@ -248,6 +482,7 @@ HERDR
 exit 0
 SLEEP
   chmod +x "$SEND_BIN/herdr" "$SEND_BIN/sleep"
+  write_fake_wait_watchdog "$SEND_BIN/wait-bounded"
 }
 
 write_phase1_send_record() {
@@ -269,6 +504,7 @@ run_send_cli() {
     TEST_IMMEDIATE_OUTPUT="$SEND_TMP/immediate.out" TEST_CREW=A \
     TEST_NEW_PROMPT="follow-up answer" TEST_OLD_RUN="${TEST_OLD_RUN:-run-old}" \
     TEST_RECORD_MODE="$TEST_RECORD_MODE" TEST_PROMPT_MODE="$TEST_PROMPT_MODE" \
+    TEST_WAIT_BOUNDED="$SEND_BIN/wait-bounded" \
     "$CREWBOSS" send A "follow-up answer"
 }
 
@@ -548,6 +784,12 @@ run_test "wait routes global FIFO and keeps other crews across restarts" \
   test_wait_routes_global_fifo_and_keeps_unselected_events_across_restarts
 run_test "spawn persists identity before prompt and keeps an immediate event" \
   test_spawn_persists_identity_before_prompt_and_keeps_an_immediate_event
+run_test "relative state is absolute in delivered event commands" \
+  test_relative_state_dir_is_absolute_in_the_delivered_event_command
+run_test "failed initial prompt marks the saved crew unknown" \
+  test_failed_initial_prompt_marks_the_saved_crew_unknown
+run_test "failed initial prompt preserves an applied event" \
+  test_failed_initial_prompt_preserves_an_applied_event
 run_test "send persists a new run and keeps an immediate event" \
   test_send_persists_new_run_before_prompt_without_clobbering_an_immediate_event
 run_test "a failed send restores the complete previous record" \

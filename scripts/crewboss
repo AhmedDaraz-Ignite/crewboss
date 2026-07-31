@@ -62,7 +62,7 @@ do_spawn() {
   name=$(cb_name "$task")
   cb_reg_get "$name" >/dev/null 2>&1 && die "crew '$name' already exists (send, open, or remove it)"
 
-  local tree pane crew_id run_id
+  local tree pane crew_id run_id failure_status
   tree=$(cb_tree_create "$branch") || die "worktree creation failed for $branch"
   pane=$(cb_pane_create "$placement" "$tree" "$name") || die "could not create a herdr pane"
   cb_agent_start "$name" "$kind" "$pane" fresh || die "agent failed to start"
@@ -76,8 +76,15 @@ do_spawn() {
        crew_id: $crew_id, run_id: $run_id, task_status: "running",
        blocked: false, message: "", last_event_seq: 0}
     ')" || die "could not save crew state"
-  cb_agent_prompt "$name" "$task" "$crew_id" "$run_id" \
-    "$CB_HOME/crewboss" "$CB_STATE_DIR" || die "could not send the task"
+  if ! cb_agent_prompt "$name" "$task" "$crew_id" "$run_id" \
+    "$CB_HOME/crewboss" "$CB_STATE_DIR"; then
+    cb_reg_mark_prompt_unknown "$name" "$crew_id" "$run_id" 0
+    failure_status=$?
+    case $failure_status in
+      0|2) die "could not send the task" ;;
+      *) die "could not send the task and could not update crew state" ;;
+    esac
+  fi
 
   echo "spawned $name  branch=$branch  pane=$pane"
   echo "watch it in herdr, or: crewboss wait $name"

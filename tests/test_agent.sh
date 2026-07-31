@@ -73,6 +73,45 @@ reset_agent_fake() {
   printf '0\n' > "$PROMPT_ATTEMPTS"
 }
 
+extract_prompt_example() {
+  local prompt=$1 kind=$2 line opener delimiter='' collecting=0 saw_delimiter=0 output=''
+  opener=" $kind \"\$(cat <<'"
+  while IFS= read -r line; do
+    if [ "$collecting" -eq 0 ]; then
+      case $line in
+        *"$opener"*)
+          delimiter=${line##* }
+          delimiter=${delimiter#"<<'"}
+          delimiter=${delimiter%"'"}
+          [ -n "$delimiter" ] || return 1
+          collecting=1
+          ;;
+        *) continue ;;
+      esac
+    fi
+    output="$output${output:+$'\n'}$line"
+    if [ "$saw_delimiter" -eq 1 ] && [ "$line" = ')"' ]; then
+      printf '%s' "$output"
+      return 0
+    fi
+    [ "$line" != "$delimiter" ] || saw_delimiter=1
+  done <<< "$prompt"
+  return 1
+}
+
+replace_prompt_payload() {
+  local example=$1 placeholder=$2 payload=$3 line found=0
+  while IFS= read -r line; do
+    if [ "$line" = "$placeholder" ]; then
+      printf '%s\n' "$payload"
+      found=1
+    else
+      printf '%s\n' "$line"
+    fi
+  done <<< "$example"
+  [ "$found" -eq 1 ]
+}
+
 test_uppercase_public_name_maps_to_lowercase_target() {
   assert_eq smoke-100 "$(cb_agent_target SMOKE-100)"
 }
@@ -169,9 +208,12 @@ test_prompt_teaches_the_shell_safe_event_protocol() {
   assert_contains "$prompt" "do the exact task" || return 1
   assert_contains "$prompt" "CrewBoss run id: run-456" || return 1
   assert_contains "$prompt" \
-    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 blocked \"the exact question\"" || return 1
+    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 blocked \"\$(cat <<'CREWBOSS_BLOCKED_PAYLOAD_" || return 1
   assert_contains "$prompt" \
-    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 done \"the final answer\"" || return 1
+    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 done \"\$(cat <<'CREWBOSS_DONE_PAYLOAD_" || return 1
+  assert_contains "$prompt" "Put the message between the opening and closing delimiter" || return 1
+  assert_contains "$prompt" "the exact question" || return 1
+  assert_contains "$prompt" "the final answer" || return 1
   assert_contains "$prompt" "emit the exact question before waiting" || return 1
   assert_contains "$prompt" "emit the final answer before ending" || return 1
   assert_not_contains "$prompt" TASKDONE
@@ -180,7 +222,8 @@ test_prompt_teaches_the_shell_safe_event_protocol() {
 test_prompt_event_examples_execute_with_hostile_values() {
   reset_agent_fake prompt
   HERDR_ENFORCE=
-  local fixture tool_dir tool state log name crew_id run_id prompt blocked_line done_line
+  local fixture tool_dir tool state log name crew_id run_id prompt blocked_example done_example
+  local blocked_payload done_payload blocked_command done_command
   fixture=$(mktemp -d)
   trap 'rm -rf "$fixture"' RETURN
   tool_dir="$fixture/CrewBoss tool's \$(touch $fixture/tool-injected)"
@@ -201,25 +244,37 @@ TOOL
   cb_agent_prompt "$name" "do the exact task" "$crew_id" "$run_id" \
     "$tool" "$state" >/dev/null || return 1
   prompt=$(cat "$PROMPT_TEXT")
-  blocked_line=$(grep ' blocked "the exact question"$' <<< "$prompt") || return 1
-  done_line=$(grep ' done "the final answer"$' <<< "$prompt") || return 1
+  blocked_example=$(extract_prompt_example "$prompt" blocked) || return 1
+  done_example=$(extract_prompt_example "$prompt" "done") || return 1
+  blocked_payload="question with 'single' and \"double\"; \$(touch $fixture/payload-dollar) \`touch $fixture/payload-backtick\` and \\\\slashes"
+  done_payload="answer; touch $fixture/payload-semicolon
+second line with \$(touch $fixture/payload-second) and \\backslash"
+  blocked_command=$(replace_prompt_payload "$blocked_example" \
+    "the exact question" "$blocked_payload") || return 1
+  done_command=$(replace_prompt_payload "$done_example" \
+    "the final answer" "$done_payload") || return 1
 
-  EVENT_LOG="$log" bash -c "$blocked_line" || return 1
-  EVENT_LOG="$log" bash -c "$done_line" || return 1
+  EVENT_LOG="$log" /bin/bash -c "$blocked_command" || return 1
+  EVENT_LOG="$log" /bin/bash -c "$done_command" || return 1
 
   jq -s -e --arg state "$state" --arg name "$name" --arg crew_id "$crew_id" \
-    --arg run_id "$run_id" '
+    --arg run_id "$run_id" --arg blocked "$blocked_payload" \
+    --arg completed "$done_payload" '
       length == 2 and
       .[0] == {state: $state,
-        args: ["emit", $name, $crew_id, $run_id, "blocked", "the exact question"]} and
+        args: ["emit", $name, $crew_id, $run_id, "blocked", $blocked]} and
       .[1] == {state: $state,
-        args: ["emit", $name, $crew_id, $run_id, "done", "the final answer"]}
+        args: ["emit", $name, $crew_id, $run_id, "done", $completed]}
     ' "$log" >/dev/null || return 1
   [ ! -e "$fixture/tool-injected" ] || return 1
   [ ! -e "$fixture/state-injected" ] || return 1
   [ ! -e "$fixture/name-injected" ] || return 1
   [ ! -e "$fixture/crew-injected" ] || return 1
-  [ ! -e "$fixture/run-injected" ]
+  [ ! -e "$fixture/run-injected" ] || return 1
+  [ ! -e "$fixture/payload-dollar" ] || return 1
+  [ ! -e "$fixture/payload-backtick" ] || return 1
+  [ ! -e "$fixture/payload-semicolon" ] || return 1
+  [ ! -e "$fixture/payload-second" ]
 }
 
 test_prompt_delivery_retries_until_the_fifth_attempt() {
