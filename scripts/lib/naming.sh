@@ -39,6 +39,6 @@ cb_agent_target() {
     return
   fi
 
-  hash=$(printf '%s' "$1" | git hash-object --stdin) || return 1
+  hash=$(printf '%s' "$1" | git --git-dir=/dev/null/crewboss hash-object --stdin) || return 1
   printf 'crew-%.27s' "$hash"
 }

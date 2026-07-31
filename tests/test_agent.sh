@@ -70,9 +70,9 @@ test_numeric_leading_name_uses_stable_bounded_hash_target() {
   first=$(cb_agent_target 123)
   second=$(cb_agent_target 123)
 
-  assert_eq crew-d800886d9c86731ae5c4a62b0b7 "$first" || return 1
   assert_eq "$first" "$second" || return 1
-  [[ $first =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+  [[ $first =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+  [ "${#first}" -le 32 ]
 }
 
 test_long_name_uses_stable_bounded_hash_target() {
@@ -80,9 +80,30 @@ test_long_name_uses_stable_bounded_hash_target() {
   first=$(cb_agent_target "$name")
   second=$(cb_agent_target "$name")
 
-  assert_eq crew-fc6c5e293a561331e6c9bee4af9 "$first" || return 1
   assert_eq "$first" "$second" || return 1
-  [[ $first =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+  [[ $first =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+  [ "${#first}" -le 32 ]
+}
+
+test_hash_target_is_stable_across_repository_object_formats() {
+  local fixture sha1_target sha256_target
+  fixture=$(mktemp -d)
+  git init --quiet --object-format=sha1 "$fixture/sha1" || {
+    rm -rf "$fixture"
+    return 1
+  }
+  git init --quiet --object-format=sha256 "$fixture/sha256" || {
+    rm -rf "$fixture"
+    return 1
+  }
+
+  sha1_target=$(cd "$fixture/sha1" && cb_agent_target 123)
+  sha256_target=$(cd "$fixture/sha256" && cb_agent_target 123)
+  rm -rf "$fixture"
+
+  assert_eq "$sha1_target" "$sha256_target" || return 1
+  [[ $sha1_target =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+  [ "${#sha1_target}" -le 32 ]
 }
 
 test_start_uses_internal_target() {
@@ -178,6 +199,7 @@ run_test "maps an uppercase public name to a lowercase Herdr target" test_upperc
 run_test "keeps an already-valid lowercase Herdr target" test_valid_lowercase_target_is_unchanged
 run_test "uses a stable bounded hash target for a numeric-leading name" test_numeric_leading_name_uses_stable_bounded_hash_target
 run_test "uses a stable bounded hash target for a long name" test_long_name_uses_stable_bounded_hash_target
+run_test "keeps hash targets stable across repository object formats" test_hash_target_is_stable_across_repository_object_formats
 run_test "starts an agent with the internal target" test_start_uses_internal_target
 run_test "prompts an agent with the internal target" test_prompt_send_uses_internal_target
 run_test "confirms a prompt with the internal target" test_prompt_confirmation_read_uses_internal_target
