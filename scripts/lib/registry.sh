@@ -4,34 +4,199 @@
 CB_STATE_DIR=${CB_STATE_DIR:-"$HOME/.local/state/crewboss"}
 CB_REG="$CB_STATE_DIR/crew.json"
 CB_REG_LOCK="$CB_STATE_DIR/crew.lock"
+CB_LOCK_OWNER_LOCK=
+CB_LOCK_OWNER_ANCHOR=
+CB_LOCK_OWNER_TICKET=
+
+_cb_lock_parse_chooser() {
+  local name=${1##*/} rest
+  CB_LOCK_PARSE_PID=
+  CB_LOCK_PARSE_TOKEN=
+
+  case $name in
+    C.*.*) ;;
+    *) return 1 ;;
+  esac
+  rest=${name#C.}
+  CB_LOCK_PARSE_PID=${rest%%.*}
+  CB_LOCK_PARSE_TOKEN=${rest#*.}
+  case $CB_LOCK_PARSE_PID in
+    ''|0|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#CB_LOCK_PARSE_PID}" -le 18 ] || return 1
+  case $CB_LOCK_PARSE_TOKEN in
+    ''|*.*|*[!A-Za-z0-9]*) return 1 ;;
+  esac
+}
+
+_cb_lock_parse_ticket() {
+  local name=${1##*/} rest
+  CB_LOCK_PARSE_TICKET=
+  CB_LOCK_PARSE_PID=
+  CB_LOCK_PARSE_TOKEN=
+
+  case $name in
+    T.*.*.*) ;;
+    *) return 1 ;;
+  esac
+  rest=${name#T.}
+  CB_LOCK_PARSE_TICKET=${rest%%.*}
+  rest=${rest#*.}
+  CB_LOCK_PARSE_PID=${rest%%.*}
+  CB_LOCK_PARSE_TOKEN=${rest#*.}
+  case $CB_LOCK_PARSE_TICKET in
+    ''|0|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#CB_LOCK_PARSE_TICKET}" -le 18 ] || return 1
+  case $CB_LOCK_PARSE_PID in
+    ''|0|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#CB_LOCK_PARSE_PID}" -le 18 ] || return 1
+  case $CB_LOCK_PARSE_TOKEN in
+    ''|*.*|*[!A-Za-z0-9]*) return 1 ;;
+  esac
+}
 
 cb_lock_acquire() {
-  local lock=$1 owner current_owner pid=${BASHPID:-$$}
-  while :; do
-    if mkdir "$lock" 2>/dev/null; then
-      if printf '%s\n' "$pid" > "$lock/pid" 2>/dev/null && chmod 700 "$lock"; then
-        return 0
-      fi
+  local lock=$1 claims old_umask anchor pid token chooser claim max_ticket=0 ticket
+  local ticket_path blocked other_ticket other_pid other_token
+  local LC_ALL=C
+  [ -z "${CB_LOCK_OWNER_LOCK:-}" ] || return 1
+  [ -z "${CB_LOCK_OWNER_ANCHOR:-}" ] || return 1
+  [ -z "${CB_LOCK_OWNER_TICKET:-}" ] || return 1
+
+  old_umask=$(umask) || return 1
+  umask 077
+  claims="$lock.claims"
+  if ! mkdir -p "$claims" 2>/dev/null || ! chmod 700 "$claims" 2>/dev/null; then
+    umask "$old_umask"
+    return 1
+  fi
+
+  anchor=$(mktemp "$claims/.id.XXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  if ! sh -c 'printf "%s\n" "$PPID" > "$1"' sh "$anchor" 2>/dev/null; then
+    rm -f "$anchor"
+    umask "$old_umask"
+    return 1
+  fi
+  pid=
+  IFS= read -r pid < "$anchor" || pid=
+  case $pid in
+    ''|0|0*|*[!0-9]*)
+      rm -f "$anchor"
+      umask "$old_umask"
       return 1
+      ;;
+  esac
+  if [ "${#pid}" -gt 18 ]; then
+    rm -f "$anchor"
+    umask "$old_umask"
+    return 1
+  fi
+  token=${anchor##*.}
+  case $token in
+    ''|*.*|*[!A-Za-z0-9]*)
+      rm -f "$anchor"
+      umask "$old_umask"
+      return 1
+      ;;
+  esac
+
+  chooser="$claims/C.$pid.$token"
+  if ! mkdir "$chooser" 2>/dev/null; then
+    rm -f "$anchor"
+    umask "$old_umask"
+    return 1
+  fi
+
+  for claim in "$claims"/T.*.*.*; do
+    [ -d "$claim" ] || continue
+    _cb_lock_parse_ticket "$claim" || continue
+    kill -0 "$CB_LOCK_PARSE_PID" 2>/dev/null || continue
+    if [ "$CB_LOCK_PARSE_TICKET" -gt "$max_ticket" ]; then
+      max_ticket=$CB_LOCK_PARSE_TICKET
+    fi
+  done
+  if [ "$max_ticket" -ge 999999999999999999 ]; then
+    rmdir "$chooser" 2>/dev/null || true
+    rm -f "$anchor"
+    umask "$old_umask"
+    return 1
+  fi
+  ticket=$((max_ticket + 1))
+  ticket_path="$claims/T.$ticket.$pid.$token"
+  if ! mv "$chooser" "$ticket_path" 2>/dev/null; then
+    rmdir "$chooser" 2>/dev/null || true
+    rm -f "$anchor"
+    umask "$old_umask"
+    return 1
+  fi
+  umask "$old_umask"
+
+  while :; do
+    blocked=0
+    for claim in "$claims"/C.*.*; do
+      [ -d "$claim" ] || continue
+      _cb_lock_parse_chooser "$claim" || continue
+      if kill -0 "$CB_LOCK_PARSE_PID" 2>/dev/null; then
+        blocked=1
+        break
+      fi
+    done
+    if [ "$blocked" -ne 0 ]; then
+      sleep 0.01
+      continue
     fi
 
-    owner=
-    if [ -f "$lock/pid" ]; then
-      IFS= read -r owner 2>/dev/null < "$lock/pid" || owner=
-      if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-        current_owner=
-        IFS= read -r current_owner 2>/dev/null < "$lock/pid" || current_owner=
-        if [ "$current_owner" = "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-          rm -rf "$lock"
-        fi
+    for claim in "$claims"/T.*.*.*; do
+      [ -d "$claim" ] || continue
+      [ "$claim" = "$ticket_path" ] && continue
+      _cb_lock_parse_ticket "$claim" || continue
+      other_ticket=$CB_LOCK_PARSE_TICKET
+      other_pid=$CB_LOCK_PARSE_PID
+      other_token=$CB_LOCK_PARSE_TOKEN
+      kill -0 "$other_pid" 2>/dev/null || continue
+      if [ "$other_ticket" -lt "$ticket" ] ||
+        { [ "$other_ticket" -eq "$ticket" ] && [ "$other_pid" -lt "$pid" ]; } ||
+        { [ "$other_ticket" -eq "$ticket" ] && [ "$other_pid" -eq "$pid" ] &&
+          [[ $other_token < $token ]]; }; then
+        blocked=1
+        break
       fi
-    fi
+    done
+    [ "$blocked" -eq 0 ] && break
     sleep 0.01
   done
+
+  CB_LOCK_OWNER_LOCK=$lock
+  CB_LOCK_OWNER_ANCHOR=$anchor
+  CB_LOCK_OWNER_TICKET=$ticket_path
 }
 
 cb_lock_release() {
-  rm -rf "$1"
+  local lock=$1 claims="$1.claims"
+  local owner_lock=${CB_LOCK_OWNER_LOCK:-}
+  local anchor=${CB_LOCK_OWNER_ANCHOR:-}
+  local ticket=${CB_LOCK_OWNER_TICKET:-}
+
+  [ "$owner_lock" = "$lock" ] || return 1
+  case $anchor in
+    "$claims"/.id.*) ;;
+    *) return 1 ;;
+  esac
+  case $ticket in
+    "$claims"/T.*.*.*) ;;
+    *) return 1 ;;
+  esac
+
+  rmdir "$ticket" 2>/dev/null || return 1
+  CB_LOCK_OWNER_LOCK=
+  CB_LOCK_OWNER_ANCHOR=
+  CB_LOCK_OWNER_TICKET=
+  rm -f "$anchor" 2>/dev/null
 }
 
 cb_reg_init() {
@@ -47,7 +212,7 @@ cb_reg_init() {
     [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
   fi
 
-  cb_lock_release "$CB_REG_LOCK"
+  cb_lock_release "$CB_REG_LOCK" || status=1
   return "$status"
 }
 
@@ -66,7 +231,7 @@ cb_reg_put() {
       "$CB_REG" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
   fi
   [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
-  cb_lock_release "$CB_REG_LOCK"
+  cb_lock_release "$CB_REG_LOCK" || status=1
   return "$status"
 }
 
@@ -81,7 +246,7 @@ cb_reg_replace() {
       chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
   fi
   [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
-  cb_lock_release "$CB_REG_LOCK"
+  cb_lock_release "$CB_REG_LOCK" || status=1
   return "$status"
 }
 
@@ -105,7 +270,7 @@ cb_reg_del() {
       mv "$tmp" "$CB_REG" || status=1
   fi
   [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
-  cb_lock_release "$CB_REG_LOCK"
+  cb_lock_release "$CB_REG_LOCK" || status=1
   return "$status"
 }
 
@@ -164,7 +329,7 @@ cb_reg_apply_event() {
     ' "$CB_REG" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
   fi
   [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
-  cb_lock_release "$CB_REG_LOCK"
+  cb_lock_release "$CB_REG_LOCK" || status=1
   return "$status"
 }
 
