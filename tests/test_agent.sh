@@ -16,6 +16,7 @@ PROMPT_ATTEMPTS=$(mktemp)
 HERDR_ENFORCE=
 HERDR_START_BUSY_COUNT=0
 PROMPT_VISIBLE_AFTER=1
+PROMPT_READ_MODE=marker
 trap 'rm -f "$HERDR_LOG" "$PROMPT_TEXT" "$PROMPT_ATTEMPTS"' EXIT
 
 sleep() {
@@ -50,7 +51,11 @@ herdr() {
     read)
       IFS= read -r attempts < "$PROMPT_ATTEMPTS" || attempts=0
       if [ "$attempts" -ge "$PROMPT_VISIBLE_AFTER" ]; then
-        sed -n '/^CrewBoss run id: /p' "$PROMPT_TEXT"
+        case $PROMPT_READ_MODE in
+          marker) sed -n '/^CrewBoss run id: /p' "$PROMPT_TEXT" ;;
+          tail) tail -n 1 "$PROMPT_TEXT" ;;
+          *) return 2 ;;
+        esac
       else
         printf 'visible pane output\n'
       fi
@@ -68,6 +73,7 @@ reset_agent_fake() {
   HERDR_ENFORCE=$1
   HERDR_START_BUSY_COUNT=0
   PROMPT_VISIBLE_AFTER=1
+  PROMPT_READ_MODE=marker
   : > "$HERDR_LOG"
   : > "$PROMPT_TEXT"
   printf '0\n' > "$PROMPT_ATTEMPTS"
@@ -208,6 +214,8 @@ test_prompt_teaches_the_shell_safe_event_protocol() {
   assert_eq '' "$output" || return 1
   assert_contains "$prompt" "do the exact task" || return 1
   assert_contains "$prompt" "CrewBoss run id: run-456" || return 1
+  assert_eq 1 "$(grep -Fc 'CrewBoss run id: run-456' <<< "$prompt")" || return 1
+  assert_eq "CrewBoss run id: run-456" "$(tail -n 1 <<< "$prompt")" || return 1
   assert_contains "$prompt" \
     "CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'CREWBOSS_BLOCKED_PAYLOAD_" || return 1
   assert_contains "$prompt" \
@@ -333,6 +341,16 @@ test_prompt_delivery_retries_until_the_fifth_attempt() {
   assert_eq 5 "$(cat "$PROMPT_ATTEMPTS")"
 }
 
+test_prompt_delivery_is_confirmed_from_the_prompt_tail() {
+  reset_agent_fake prompt
+  PROMPT_READ_MODE='tail'
+
+  cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
+    /tmp/crewboss /tmp/state >/dev/null || return 1
+
+  assert_eq 1 "$(cat "$PROMPT_ATTEMPTS")"
+}
+
 test_general_read_uses_internal_target() {
   reset_agent_fake read
 
@@ -406,6 +424,8 @@ run_test "keeps hostile values inert in executable event examples" test_prompt_e
 run_test "preserves zero one and multiple trailing payload newlines" \
   test_prompt_event_examples_preserve_trailing_newlines
 run_test "retries prompt delivery through the fifth attempt" test_prompt_delivery_retries_until_the_fifth_attempt
+run_test "confirms delivered prompts from the pane tail on the first attempt" \
+  test_prompt_delivery_is_confirmed_from_the_prompt_tail
 run_test "reads an agent with the internal target" test_general_read_uses_internal_target
 run_test "explains an agent with the internal target" test_state_uses_internal_target
 run_test "focuses the internal target through the public registry key" test_focus_uses_internal_target_and_public_registry_key

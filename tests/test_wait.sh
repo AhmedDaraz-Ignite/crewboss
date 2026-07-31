@@ -283,7 +283,10 @@ case "$1 $2" in
         copying = 1
         next
       }
-      copying { print }
+      copying {
+        print
+        if ($0 == "unset CREWBOSS_EVENT_PAYLOAD") exit
+      }
     ' "$TEST_PROMPT" > "$TEST_EMIT_SCRIPT" || exit 70
     [ -s "$TEST_EMIT_SCRIPT" ] || exit 71
     (

@@ -52,8 +52,6 @@ cb_agent_prompt() {
   q_state=$(_cb_agent_shell_quote "$state_dir") || return 1
   prompt="$task
 
-$marker
-
 Use CrewBoss events to report this run. Put the exact message between the opening and closing delimiter. Keep the single quotes around the opening delimiter so shell syntax in the message stays inert. If the message contains the closing delimiter on a line by itself, append _X to both delimiter occurrences. Leave the suffix and cleanup lines unchanged; they preserve intentional trailing newlines.
 
 When you need an answer, emit the exact question before waiting:
@@ -76,7 +74,9 @@ printf '%s' '$payload_suffix'
 CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%$payload_suffix}
 CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%\$'\\n'}
 CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id done \"\$CREWBOSS_EVENT_PAYLOAD\"
-unset CREWBOSS_EVENT_PAYLOAD"
+unset CREWBOSS_EVENT_PAYLOAD
+
+$marker"
 
   while :; do
     herdr agent prompt "$target" "$prompt" >/dev/null || return 1
