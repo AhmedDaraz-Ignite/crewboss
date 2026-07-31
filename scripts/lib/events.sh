@@ -2,6 +2,44 @@
 # events: one append-only JSON Lines source shared by every crew.
 CB_EVENT_SOURCE="$CB_STATE_DIR/events.jsonl"
 CB_EVENT_LOCK="$CB_STATE_DIR/events.lock"
+CB_EVENT_MAX_SEQ=2147483647
+CB_EVENT_LAST_SEQ=
+
+_cb_event_parse_last_seq() {
+  local record=$1 raw max_length=${#CB_EVENT_MAX_SEQ}
+  CB_EVENT_LAST_SEQ=
+
+  case $record in
+    '{"version":1,"seq":'*,*) ;;
+    *) return 1 ;;
+  esac
+  raw=${record#'{"version":1,"seq":'}
+  raw=${raw%%,*}
+  case $raw in
+    ''|0|0*|*[!0-9]*) return 1 ;;
+  esac
+  if [ "${#raw}" -gt "$max_length" ] ||
+    { [ "${#raw}" -eq "$max_length" ] && [ "$raw" -gt "$CB_EVENT_MAX_SEQ" ]; }; then
+    return 1
+  fi
+  [ "$raw" != "$CB_EVENT_MAX_SEQ" ] || return 1
+
+  jq -e --arg seq "$raw" '
+    type == "object" and
+    keys == ["crew","crew_id","event_id","kind","payload","run_id","seq","time","version"] and
+    .version == 1 and
+    .seq == ($seq | tonumber) and
+    .event_id == ("event-" + $seq) and
+    (.crew | type == "string" and length > 0) and
+    (.crew_id | type == "string" and length > 0) and
+    (.run_id | type == "string" and length > 0) and
+    (.kind == "blocked" or .kind == "done") and
+    (.payload | type == "string" and length > 0) and
+    (.time | type == "string" and length > 0)
+  ' <<< "$record" >/dev/null || return 1
+
+  CB_EVENT_LAST_SEQ=$raw
+}
 
 cb_event_init() {
   mkdir -p "$CB_STATE_DIR" || return 1
@@ -41,26 +79,13 @@ cb_event_emit() {
   if [ -s "$CB_EVENT_SOURCE" ]; then
     last=$(tail -n 1 "$CB_EVENT_SOURCE") || status=1
     if [ "$status" -eq 0 ]; then
-      jq -e '
-        type == "object" and
-        keys == ["crew","crew_id","event_id","kind","payload","run_id","seq","time","version"] and
-        .version == 1 and
-        (.seq | type == "number") and
-        (.seq | floor == . and . > 0) and
-        .event_id == ("event-" + (.seq | tostring)) and
-        (.crew | type == "string" and length > 0) and
-        (.crew_id | type == "string" and length > 0) and
-        (.run_id | type == "string" and length > 0) and
-        (.kind == "blocked" or .kind == "done") and
-        (.payload | type == "string" and length > 0) and
-        (.time | type == "string" and length > 0)
-      ' <<< "$last" >/dev/null || status=1
+      _cb_event_parse_last_seq "$last" || status=1
     fi
     if [ "$status" -eq 0 ]; then
-      last_seq=$(jq -r '.seq' <<< "$last") || status=1
+      last_seq=$CB_EVENT_LAST_SEQ
     fi
     if [ "$status" -eq 0 ]; then
-      seq=$((last_seq + 1))
+      seq=$((10#$last_seq + 1))
     fi
   else
     seq=1

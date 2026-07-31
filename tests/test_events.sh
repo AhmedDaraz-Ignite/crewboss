@@ -13,7 +13,57 @@ setup_events() {
   trap 'rm -rf "$TEST_TMP"' EXIT
   # shellcheck source=scripts/lib/registry.sh
   source "$PROJECT_ROOT/scripts/lib/registry.sh"
+  # shellcheck source=scripts/lib/events.sh
+  source "$PROJECT_ROOT/scripts/lib/events.sh"
   cb_reg_put alpha '{"crew_id":"crew-current","run_id":"run-current"}'
+}
+
+write_event_tail_fixture() {
+  local raw_seq=$1 event_id=$2
+  cb_event_init || return 1
+  printf '{"version":1,"seq":%s,"event_id":"%s","crew":"alpha","crew_id":"crew-current","run_id":"run-current","kind":"done","payload":"fixture","time":"2026-07-31T12:00:00Z"}\n' \
+    "$raw_seq" "$event_id" > "$CB_EVENT_SOURCE"
+}
+
+run_emit_with_owner_snapshot() {
+  local status_file="$TEST_TMP/emit.status" owner_file="$TEST_TMP/emit.owner"
+  CB_STATE_DIR="$CB_STATE_DIR" bash -c '
+    source "$1"
+    source "$2"
+    status_file=$3
+    owner_file=$4
+    record_exit() {
+      local status=$?
+      printf "%s\n" "$status" > "$status_file"
+      printf "%s\n" "${CB_LOCK_OWNER_LOCK:-}" > "$owner_file"
+    }
+    trap record_exit EXIT
+    cb_event_emit alpha crew-current run-current done after-fixture
+    exit $?
+  ' bash "$PROJECT_ROOT/scripts/lib/registry.sh" \
+    "$PROJECT_ROOT/scripts/lib/events.sh" "$status_file" "$owner_file" \
+    >/dev/null 2>&1
+
+  EMIT_STATUS=
+  EMIT_OWNER=
+  IFS= read -r EMIT_STATUS < "$status_file" || return 1
+  IFS= read -r EMIT_OWNER < "$owner_file" || return 1
+}
+
+assert_tail_rejected_and_unlocked() {
+  setup_events || return 1
+  write_event_tail_fixture "$1" "$2" || return 1
+
+  local before after
+  before=$(cat "$CB_EVENT_SOURCE") || return 1
+  run_emit_with_owner_snapshot || true
+  after=$(cat "$CB_EVENT_SOURCE") || return 1
+
+  assert_eq 1 "$EMIT_STATUS" || return 1
+  assert_eq '' "$EMIT_OWNER" || return 1
+  assert_eq "$before" "$after" || return 1
+  cb_lock_acquire "$CB_EVENT_LOCK" || return 1
+  cb_lock_release "$CB_EVENT_LOCK"
 }
 
 wait_for_producers() {
@@ -140,10 +190,53 @@ test_emit_refuses_to_append_after_a_malformed_last_record() {
   assert_eq 2 "$(wc -l < "$CB_STATE_DIR/events.jsonl" | tr -d ' ')"
 }
 
+test_noncanonical_sequence_tokens_are_rejected_and_unlock() {
+  (assert_tail_rejected_and_unlocked 1.5 event-1.5) || return 1
+  (assert_tail_rejected_and_unlocked 1e3 event-1E+3) || return 1
+  (assert_tail_rejected_and_unlocked 1e100 event-1E+100) || return 1
+  (assert_tail_rejected_and_unlocked 0 event-0) || return 1
+  (assert_tail_rejected_and_unlocked -1 event--1) || return 1
+  (assert_tail_rejected_and_unlocked 01 event-1)
+}
+
+test_maximum_and_larger_sequences_are_rejected_and_unlock() {
+  (assert_tail_rejected_and_unlocked 2147483647 event-2147483647) || return 1
+  (assert_tail_rejected_and_unlocked 2147483648 event-2147483648)
+}
+
+test_sequence_immediately_below_maximum_appends_the_maximum_once() {
+  setup_events || return 1
+  write_event_tail_fixture 2147483646 event-2147483646 || return 1
+
+  CB_STATE_DIR="$CB_STATE_DIR" "$CREWBOSS" emit \
+    alpha crew-current run-current "done" reaches-maximum >/dev/null 2>&1 || return 1
+  jq -s -e '
+    length == 2 and
+    .[1].seq == 2147483647 and
+    .[1].event_id == "event-2147483647" and
+    .[1].payload == "reaches-maximum"
+  ' "$CB_EVENT_SOURCE" >/dev/null || return 1
+
+  local before after
+  before=$(cat "$CB_EVENT_SOURCE") || return 1
+  ! CB_STATE_DIR="$CB_STATE_DIR" "$CREWBOSS" emit \
+    alpha crew-current run-current "done" over-maximum >/dev/null 2>&1 || return 1
+  after=$(cat "$CB_EVENT_SOURCE") || return 1
+  assert_eq "$before" "$after" || return 1
+  cb_lock_acquire "$CB_EVENT_LOCK" || return 1
+  cb_lock_release "$CB_EVENT_LOCK"
+}
+
 run_test "concurrent emit is one physical FIFO and keeps the source inode" \
   test_concurrent_emit_is_one_physical_fifo_and_keeps_the_inode
 run_test "emit rejects unknown stale and invalid producers before append" \
   test_emit_rejects_invalid_producers_before_append
 run_test "emit refuses to append after a malformed last event" \
   test_emit_refuses_to_append_after_a_malformed_last_record
+run_test "noncanonical sequence tokens are rejected without keeping the lock" \
+  test_noncanonical_sequence_tokens_are_rejected_and_unlock
+run_test "maximum and larger sequences are rejected without keeping the lock" \
+  test_maximum_and_larger_sequences_are_rejected_and_unlock
+run_test "the sequence below maximum appends maximum exactly once" \
+  test_sequence_immediately_below_maximum_appends_the_maximum_once
 finish_tests
