@@ -23,7 +23,7 @@ crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herd
   crewboss spawn <task...>   [--in tab|space|split] [--agent KIND] [--branch NAME]
   crewboss list
   crewboss send  <name> <text...>
-  crewboss wait  <name>            block (zero tokens) until the crew reports done, then print its reply
+  crewboss wait  <name>...         wait for the first blocked or done crew event, then print it
   crewboss read  <name> [lines]
   crewboss focus <name>            jump herdr to that crew's pane
   crewboss close <name>            close the pane; worktree and conversation are kept
@@ -102,16 +102,18 @@ do_send() {
 }
 
 do_wait() {
-  local name=$1 pane token
-  require_crew "$name"
-  pane=$(cb_reg_field "$name" pane)
-  token=$(cb_reg_field "$name" token)
-  [ -n "$token" ] || die "nothing pending for '$name' (spawn or send first)"
-  if ! cb_agent_wait "$pane" "$token"; then
-    die "'$name' has not finished (state: $(cb_agent_state "$name")); wait again or crewboss read $name"
-  fi
-  cb_reg_put "$name" '{"token": ""}'
-  cb_agent_read "$name"
+  local name event crew kind
+  for name in "$@"; do
+    require_crew "$name"
+  done
+  event=$(cb_event_next "$@") || die "could not read crew events"
+  crew=$(jq -r '.crew' <<< "$event") || die "could not read crew event"
+  kind=$(jq -r '.kind' <<< "$event") || die "could not read crew event"
+
+  printf '%s %s\n' "$crew" "$kind" || return 1
+  jq -r '.payload' <<< "$event" || return 1
+  cb_event_ack "$event" ||
+    die "event was printed but could not be acknowledged; wait may print it again"
 }
 
 do_read() {
@@ -191,7 +193,7 @@ case $cmd in
   spawn)  do_spawn "$@" ;;
   list)   do_list ;;
   send)   [ $# -ge 2 ] || die "usage: crewboss send <name> <text...>"; do_send "$@" ;;
-  wait)   [ $# -ge 1 ] || die "usage: crewboss wait <name>"; do_wait "$1" ;;
+  wait)   [ $# -ge 1 ] || die "usage: crewboss wait <name>..."; do_wait "$@" ;;
   read)   [ $# -ge 1 ] || die "usage: crewboss read <name> [lines]"; do_read "$@" ;;
   focus)  [ $# -ge 1 ] || die "usage: crewboss focus <name>"; do_focus "$1" ;;
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
