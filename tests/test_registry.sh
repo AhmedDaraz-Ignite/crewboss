@@ -620,6 +620,45 @@ test_replace_and_endpoint_state_write_atomically() {
   jq -e '.crew == {"crew_id":"crew-current","run_id":"run-current","endpoint_state":"unknown"}' "$CB_REG" >/dev/null
 }
 
+test_endpoint_reconcile_closes_the_matching_open_lifecycle_atomically() {
+  setup_registry
+  cb_reg_put crew '{"pane":"w1:p1","status":"open","endpoint_state":"open","kept":"value"}' || return 1
+
+  cb_reg_reconcile_endpoint crew w1:p1 closed || return 1
+
+  jq -e '.crew == {pane:"w1:p1",status:"closed",endpoint_state:"closed",kept:"value"}' \
+    "$CB_REG" >/dev/null
+}
+
+test_stale_endpoint_reconcile_cannot_overwrite_a_reopened_pane() {
+  setup_registry
+  cb_reg_put crew '{"pane":"w1:p1","status":"open","endpoint_state":"unknown","kept":"value"}' || return 1
+  cb_reg_put crew '{"pane":"w1:p2","status":"open","endpoint_state":"open"}' || return 1
+  local before status after
+  before=$(jq -c '.crew' "$CB_REG") || return 1
+
+  cb_reg_reconcile_endpoint crew w1:p1 closed >/dev/null 2>&1
+  status=$?
+  after=$(jq -c '.crew' "$CB_REG") || return 1
+
+  assert_eq 2 "$status" || return 1
+  assert_eq "$before" "$after"
+}
+
+test_endpoint_reconcile_requires_an_open_lifecycle() {
+  setup_registry
+  cb_reg_put crew '{"pane":"w1:p1","status":"closed","endpoint_state":"closed"}' || return 1
+  local before status after
+  before=$(jq -c '.crew' "$CB_REG") || return 1
+
+  cb_reg_reconcile_endpoint crew w1:p1 unknown >/dev/null 2>&1
+  status=$?
+  after=$(jq -c '.crew' "$CB_REG") || return 1
+
+  assert_eq 2 "$status" || return 1
+  assert_eq "$before" "$after"
+}
+
 test_new_ids_keep_the_requested_prefix_and_are_unique() {
   setup_registry
 
@@ -686,6 +725,12 @@ run_test "replaying an event keeps the same task state" test_replaying_an_event_
 run_test "an old crew identity is stale without changing state" test_old_crew_identity_returns_stale_without_changing_the_record
 run_test "an old run identity is stale without changing state" test_old_run_identity_returns_stale_without_changing_the_record
 run_test "replace and endpoint state keep only current record fields" test_replace_and_endpoint_state_write_atomically
+run_test "endpoint reconciliation atomically closes a matching open lifecycle" \
+  test_endpoint_reconcile_closes_the_matching_open_lifecycle_atomically
+run_test "a stale endpoint probe cannot overwrite a reopened pane" \
+  test_stale_endpoint_reconcile_cannot_overwrite_a_reopened_pane
+run_test "endpoint reconciliation requires an open lifecycle" \
+  test_endpoint_reconcile_requires_an_open_lifecycle
 run_test "new registry identities use unique requested prefixes" test_new_ids_keep_the_requested_prefix_and_are_unique
 run_test "send receipts bind the exact prepared transaction" \
   test_send_receipt_binds_the_exact_prepared_transaction

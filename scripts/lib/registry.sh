@@ -578,3 +578,42 @@ cb_reg_set_endpoint() {
   esac
   cb_reg_put "$1" "$(jq -n --arg state "$2" '{endpoint_state: $state}')"
 }
+
+cb_reg_reconcile_endpoint() {
+  local name=$1 expected_pane=$2 endpoint_state=$3 current replacement tmp status=0
+  case $endpoint_state in
+    open|closed|unknown) ;;
+    *) return 1 ;;
+  esac
+
+  cb_reg_init || return 1
+  cb_lock_acquire "$CB_REG_LOCK" || return 1
+  jq -e 'type == "object"' "$CB_REG" >/dev/null || status=1
+  if [ "$status" -eq 0 ]; then
+    current=$(jq -cer --arg n "$name" '.[$n] // empty' "$CB_REG") || status=2
+  fi
+  if [ "$status" -eq 0 ]; then
+    jq -e --arg pane "$expected_pane" '
+      .status == "open" and ((.pane // "") == $pane)
+    ' <<< "$current" >/dev/null || status=2
+  fi
+  if [ "$status" -eq 0 ]; then
+    replacement=$(jq -c --arg endpoint_state "$endpoint_state" '
+      if $endpoint_state == "closed" then
+        . + {endpoint_state: $endpoint_state, status: "closed"}
+      else
+        . + {endpoint_state: $endpoint_state}
+      end
+    ' <<< "$current") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    tmp=$(mktemp "$CB_STATE_DIR/.crew.json.XXXXXX") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    jq --arg n "$name" --argjson replacement "$replacement" '.[$n] = $replacement' \
+      "$CB_REG" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
+  fi
+  [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
+  cb_lock_release "$CB_REG_LOCK" || status=1
+  return "$status"
+}

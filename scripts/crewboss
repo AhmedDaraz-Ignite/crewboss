@@ -72,7 +72,7 @@ do_spawn() {
     --arg k "$kind" --arg pl "$placement" --arg task "$task" \
     --arg crew_id "$crew_id" --arg run_id "$run_id" '
       {branch: $b, path: $p, pane: $pane, agent: $k, placement: $pl,
-       status: "open", task: $task, latest_prompt: $task,
+       status: "open", endpoint_state: "open", task: $task, latest_prompt: $task,
        crew_id: $crew_id, run_id: $run_id, task_status: "running",
        blocked: false, message: "", last_event_seq: 0}
     ')" || die "could not save crew state"
@@ -92,15 +92,54 @@ do_spawn() {
 
 do_list() {
   cb_reg_init
-  local n state
-  printf '%-20s %-8s %-45s %s\n' NAME STATE BRANCH PANE
+  cb_event_pump || die "could not read crew events"
+  local n record lifecycle pane endpoint reconcile_status
   for n in $(cb_reg_names); do
-    if [ "$(cb_reg_field "$n" status)" = closed ]; then
-      state=closed
+    record=$(cb_reg_get "$n") || die "could not read crew '$n'"
+    lifecycle=$(jq -r '.status // empty' <<< "$record") || die "could not read crew '$n'"
+    [ "$lifecycle" = open ] || continue
+    pane=$(jq -r '.pane // empty' <<< "$record") || die "could not read crew '$n'"
+    if [ -n "$pane" ]; then
+      endpoint=$(cb_pane_status "$pane" "$n") || die "could not inspect crew '$n'"
     else
-      state=$(cb_agent_state "$n"); state=${state:-unknown}
+      endpoint=unknown
     fi
-    printf '%-20s %-8s %-45s %s\n' "$n" "$state" "$(cb_reg_field "$n" branch)" "$(cb_reg_field "$n" pane)"
+    cb_reg_reconcile_endpoint "$n" "$pane" "$endpoint"
+    reconcile_status=$?
+    case $reconcile_status in
+      0|2) ;;
+      *) die "could not update crew '$n'" ;;
+    esac
+  done
+
+  local task_state branch summary
+  printf '%-20s %-9s %-9s %-45s %s\n' NAME ENDPOINT TASK BRANCH SUMMARY
+  for n in $(cb_reg_names); do
+    record=$(cb_reg_get "$n") || die "could not read crew '$n'"
+    endpoint=$(jq -r '
+      if (.endpoint_state == "open" or .endpoint_state == "closed" or
+          .endpoint_state == "unknown") then .endpoint_state else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    task_state=$(jq -r '
+      if (.task_status == "running" or .task_status == "blocked" or
+          .task_status == "done" or .task_status == "unknown")
+      then .task_status else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    branch=$(jq -r '
+      if ((.branch? | type) == "string" and (.branch | length) > 0)
+      then .branch else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    summary=$(jq -r '
+      if ((.task? | type) == "string" and (.task | length) > 0) then
+        .task | gsub("[\\r\\n\\t]+"; " ") | gsub(" +"; " ") |
+        sub("^ +"; "") | sub(" +$"; "") |
+        if length == 0 then "unknown"
+        elif length > 60 then .[0:57] + "..."
+        else . end
+      else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    printf '%-20s %-9s %-9s %-45s %s\n' \
+      "$n" "$endpoint" "$task_state" "$branch" "$summary"
   done
 }
 
@@ -165,7 +204,7 @@ close_crew() {
   local name=$1
   cb_pane_close "$(cb_reg_field "$name" pane)" "$name" ||
     die "could not safely close '$name'"
-  cb_reg_put "$name" '{"status": "closed"}' ||
+  cb_reg_put "$name" '{"status": "closed", "endpoint_state": "closed"}' ||
     die "could not update the crew registry"
 }
 
@@ -185,7 +224,9 @@ do_open() {
   placement=$(cb_reg_field "$name" placement)
   pane=$(cb_pane_create "$placement" "$tree" "$name") || die "could not create a herdr pane"
   cb_agent_start "$name" "$kind" "$pane" resume || die "agent failed to resume"
-  cb_reg_put "$name" "$(jq -n --arg p "$pane" '{pane: $p, status: "open"}')"
+  cb_reg_put "$name" "$(jq -n --arg p "$pane" \
+    '{pane: $p, status: "open", endpoint_state: "open"}')" ||
+    die "could not update the crew registry"
   echo "reopened $name  pane=$pane (conversation resumed)"
 }
 

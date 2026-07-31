@@ -195,7 +195,8 @@ case "$1 $2" in
       .[$name].latest_prompt == "ABC-123 immediate task" and
       (.[$name].crew_id | type == "string" and startswith("crew-")) and
       (.[$name].run_id | type == "string" and startswith("run-")) and
-      .[$name].status == "open" and .[$name].task_status == "running" and
+      .[$name].status == "open" and .[$name].endpoint_state == "open" and
+      .[$name].task_status == "running" and
       (.[$name] | has("token") | not)
     ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 70
     crew_id=$(jq -r '.["ABC-123"].crew_id' "$CB_STATE_DIR/crew.json") || exit 71
@@ -234,6 +235,7 @@ SLEEP
   jq -e '.["ABC-123"] as $crew |
     $crew.task == "ABC-123 immediate task" and
     $crew.latest_prompt == "ABC-123 immediate task" and
+    $crew.endpoint_state == "open" and
     $crew.task_status == "done" and $crew.blocked == false and
     $crew.message == "immediate result" and $crew.last_event_seq == 1
   ' "$state/crew.json" >/dev/null
@@ -780,6 +782,104 @@ test_wait_prunes_a_stale_pending_run_before_listening() {
   assert_eq $'A done\nnew result' "$RUN_OUTPUT"
 }
 
+list_row_fields() {
+  awk -v selected="$1" '
+    $1 == selected {
+      summary = $0
+      for (i = 1; i <= 4; i += 1) {
+        sub(/^[^[:space:]]+[[:space:]]+/, "", summary)
+      }
+      print $1 "|" $2 "|" $3 "|" $4 "|" summary
+    }
+  ' <<< "$2"
+}
+
+test_list_pumps_events_and_reconciles_every_open_endpoint() {
+  local fixture bin state output calls
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' RETURN
+  bin="$fixture/bin"
+  state="$fixture/state"
+  mkdir -p "$bin" "$state" || return 1
+
+  cat > "$bin/herdr" <<'HERDR'
+#!/bin/bash
+printf '%s\n' "$*" >> "$TEST_LIST_HERDR_LOG"
+[ "$1 $2" = "agent get" ] || exit 9
+case $3 in
+  a) printf '{"result":{"agent":{"pane_id":"w1:p1"}}}\n' ;;
+  b) printf '{"error":{"code":"agent_not_found"}}\n'; exit 1 ;;
+  c) printf '{"error":{"code":"agent_not_found_stale"}}\n'; exit 1 ;;
+  d) printf '{"error":{"code":"daemon_unavailable"}}\n'; exit 1 ;;
+  e) printf '{"result":{"agent":{}}}\n' ;;
+  f) printf '{"result":{"agent":{"pane_id":"w1:p99"}}}\n' ;;
+  *) exit 9 ;;
+esac
+HERDR
+  chmod +x "$bin/herdr" || return 1
+
+  jq -n '{
+    A:{branch:"branch-a",pane:"w1:p1",status:"open",endpoint_state:"unknown",
+       crew_id:"crew-a",run_id:"run-a",task_status:"running",last_event_seq:0,
+       task:"A first line\nsecond line"},
+    B:{branch:"branch-b",pane:"w1:p2",status:"open",endpoint_state:"open",
+       crew_id:"crew-b",run_id:"run-b",task_status:"running",last_event_seq:0,
+       task:"B task"},
+    C:{branch:"branch-c",pane:"w1:p3",status:"open",endpoint_state:"open",
+       crew_id:"crew-c",run_id:"run-c",task_status:"running",last_event_seq:0,
+       task:"C task"},
+    D:{branch:"branch-d",pane:"w1:p4",status:"open",endpoint_state:"open",
+       crew_id:"crew-d",run_id:"run-d",task_status:"running",last_event_seq:0,
+       task:"D task"},
+    E:{branch:"branch-e",pane:"w1:p5",status:"open",endpoint_state:"open",
+       crew_id:"crew-e",run_id:"run-e",task_status:"running",last_event_seq:0,
+       task:"E task"},
+    F:{branch:"branch-f",pane:"w1:p6",status:"open",endpoint_state:"open",
+       crew_id:"crew-f",run_id:"run-f",task_status:"running",last_event_seq:0,
+       task:"F task"},
+    LEGACY:{branch:"legacy-branch",pane:"w1:p7",status:"closed"}
+  }' > "$state/crew.json" || return 1
+  printf '%s\n' \
+    '{"version":1,"seq":1,"event_id":"event-1","crew":"A","crew_id":"crew-a","run_id":"run-a","kind":"done","payload":"A result","time":"2026-07-31T12:00:01Z"}' \
+    > "$state/events.jsonl" || return 1
+  : > "$fixture/herdr.log"
+  export TEST_LIST_HERDR_LOG="$fixture/herdr.log"
+
+  output=$(PATH="$bin:$PATH" CB_STATE_DIR="$state" "$CREWBOSS" list) || return 1
+
+  assert_eq 'NAME|ENDPOINT|TASK|BRANCH|SUMMARY' \
+    "$(awk 'NR == 1 {print $1 "|" $2 "|" $3 "|" $4 "|" $5}' <<< "$output")" || return 1
+  assert_eq 'A|open|done|branch-a|A first line second line' \
+    "$(list_row_fields A "$output")" || return 1
+  assert_eq 'B|closed|running|branch-b|B task' \
+    "$(list_row_fields B "$output")" || return 1
+  assert_eq 'C|unknown|running|branch-c|C task' \
+    "$(list_row_fields C "$output")" || return 1
+  assert_eq 'D|unknown|running|branch-d|D task' \
+    "$(list_row_fields D "$output")" || return 1
+  assert_eq 'E|unknown|running|branch-e|E task' \
+    "$(list_row_fields E "$output")" || return 1
+  assert_eq 'F|unknown|running|branch-f|F task' \
+    "$(list_row_fields F "$output")" || return 1
+  assert_eq 'LEGACY|unknown|unknown|legacy-branch|unknown' \
+    "$(list_row_fields LEGACY "$output")" || return 1
+  jq -e '
+    .A.endpoint_state == "open" and .A.task_status == "done" and
+    .B.endpoint_state == "closed" and .B.status == "closed" and
+    .C.endpoint_state == "unknown" and .C.status == "open" and
+    .D.endpoint_state == "unknown" and .D.status == "open" and
+    .E.endpoint_state == "unknown" and .E.status == "open" and
+    .F.endpoint_state == "unknown" and .F.status == "open" and .F.pane == "w1:p6" and
+    (.LEGACY | has("endpoint_state") | not) and
+    (.LEGACY | has("task_status") | not)
+  ' "$state/crew.json" >/dev/null || return 1
+  jq -e '.cursor == 1 and .pending["crew-a"].event_id == "event-1"' \
+    "$state/event-state.json" >/dev/null || return 1
+  calls=$(cat "$fixture/herdr.log") || return 1
+  assert_eq $'agent get a\nagent get b\nagent get c\nagent get d\nagent get e\nagent get f' "$calls" || return 1
+  assert_not_contains "$calls" 'pane close'
+}
+
 run_test "wait routes global FIFO and keeps other crews across restarts" \
   test_wait_routes_global_fifo_and_keeps_unselected_events_across_restarts
 run_test "spawn persists identity before prompt and keeps an immediate event" \
@@ -824,4 +924,6 @@ run_test "output failure leaves the event pending" \
   test_output_failure_keeps_the_pending_event
 run_test "wait prunes a stale pending run before listening" \
   test_wait_prunes_a_stale_pending_run_before_listening
+run_test "list pumps events and reconciles every open endpoint" \
+  test_list_pumps_events_and_reconciles_every_open_endpoint
 finish_tests

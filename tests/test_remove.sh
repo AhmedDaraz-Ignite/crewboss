@@ -63,6 +63,7 @@ write_phase1_registry() {
       placement: "tab",
       token: "old-token",
       status: "open",
+      endpoint_state: "open",
       task: "initial task",
       latest_prompt: "follow-up",
       crew_id: "crew-a",
@@ -276,7 +277,7 @@ test_close_and_open_preserve_phase1_state_and_event_files() {
   write_phase1_registry
   write_phase1_events
   local before output status
-  before=$(jq -c '.crew | del(.status, .pane)' "$TEST_STATE/crew.json") || return 1
+  before=$(jq -c '.crew | del(.status, .endpoint_state, .pane)' "$TEST_STATE/crew.json") || return 1
   cp "$TEST_STATE/events.jsonl" "$TEST_TMP/events.before" || return 1
   cp "$TEST_STATE/event-state.json" "$TEST_TMP/event-state.before" || return 1
 
@@ -284,16 +285,18 @@ test_close_and_open_preserve_phase1_state_and_event_files() {
   status=$?
   assert_eq 0 "$status" || return 1
   assert_contains "$output" "closed crew" || return 1
-  assert_eq closed "$(jq -r '.crew.status' "$TEST_STATE/crew.json")" || return 1
+  jq -e '.crew.status == "closed" and .crew.endpoint_state == "closed"' \
+    "$TEST_STATE/crew.json" >/dev/null || return 1
 
   output=$(run_crewboss open crew 2>&1)
   status=$?
   assert_eq 0 "$status" || return 1
   assert_contains "$output" "reopened crew" || return 1
-  assert_eq open "$(jq -r '.crew.status' "$TEST_STATE/crew.json")" || return 1
+  jq -e '.crew.status == "open" and .crew.endpoint_state == "open"' \
+    "$TEST_STATE/crew.json" >/dev/null || return 1
   assert_eq w2:p2 "$(jq -r '.crew.pane' "$TEST_STATE/crew.json")" || return 1
   assert_eq "$before" \
-    "$(jq -c '.crew | del(.status, .pane)' "$TEST_STATE/crew.json")" || return 1
+    "$(jq -c '.crew | del(.status, .endpoint_state, .pane)' "$TEST_STATE/crew.json")" || return 1
   cmp -s "$TEST_TMP/events.before" "$TEST_STATE/events.jsonl" || return 1
   cmp -s "$TEST_TMP/event-state.before" "$TEST_STATE/event-state.json"
 }

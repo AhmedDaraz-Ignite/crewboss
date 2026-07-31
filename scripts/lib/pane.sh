@@ -21,6 +21,39 @@ cb_pane_create() {
   esac
 }
 
+cb_pane_status() {
+  local pane=$1 name=$2 response status live code target
+  target=$(cb_agent_target "$name") || {
+    printf 'unknown\n'
+    return 0
+  }
+  response=$(herdr agent get "$target" 2>&1)
+  status=$?
+
+  if [ "$status" -ne 0 ]; then
+    code=$(printf '%s' "$response" | jq -ers '
+      select(length == 1) | .[0].error.code |
+      select(type == "string" and length > 0)
+    ') || code=
+    if [ "$code" = agent_not_found ]; then
+      printf 'closed\n'
+    else
+      printf 'unknown\n'
+    fi
+    return 0
+  fi
+
+  live=$(printf '%s' "$response" | jq -ers '
+    select(length == 1) | .[0].result.agent.pane_id |
+    select(type == "string" and length > 0)
+  ') || live=
+  if [ -n "$live" ] && [ "$live" = "$pane" ]; then
+    printf 'open\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
 cb_pane_close() {
   local pane=$1 name=$2 response status live target
   target=$(cb_agent_target "$name") || return 1
