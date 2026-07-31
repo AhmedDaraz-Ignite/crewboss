@@ -153,6 +153,7 @@ test_state_uses_internal_target() {
 test_focus_uses_internal_target_and_public_registry_key() {
   local fixture bin state log output status
   fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' RETURN
   bin="$fixture/bin"
   state="$fixture/state"
   log="$fixture/herdr.log"
@@ -181,18 +182,11 @@ HERDR
     "$PROJECT_ROOT/scripts/crewboss" focus SMOKE-100 2>&1)
   status=$?
 
-  assert_eq 0 "$status" || { rm -rf "$fixture"; return 1; }
-  assert_eq '' "$output" || { rm -rf "$fixture"; return 1; }
-  assert_eq "agent focus smoke-100" "$(cat "$log")" || {
-    rm -rf "$fixture"
-    return 1
-  }
+  assert_eq 0 "$status" || return 1
+  assert_eq '' "$output" || return 1
+  assert_eq "agent focus smoke-100" "$(cat "$log")" || return 1
   jq -e 'has("SMOKE-100") and (has("smoke-100") | not)' \
-    "$state/crew.json" >/dev/null || {
-      rm -rf "$fixture"
-      return 1
-    }
-  rm -rf "$fixture"
+    "$state/crew.json" >/dev/null
 }
 
 run_test "maps an uppercase public name to a lowercase Herdr target" test_uppercase_public_name_maps_to_lowercase_target

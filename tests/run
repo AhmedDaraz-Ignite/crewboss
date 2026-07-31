@@ -3,15 +3,15 @@ set -u
 
 TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "$TEST_ROOT/.." && pwd)
-status=0
 
+bash -n "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh || exit $?
+"$PROJECT_ROOT/scripts/crewboss" help >/dev/null || exit $?
+shellcheck "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh || exit $?
+
+status=0
 for test_file in "$TEST_ROOT"/test_*.sh; do
   [ "$(basename "$test_file")" = test_helper.sh ] && continue
   bash "$test_file" || status=1
 done
 
 [ "$status" -eq 0 ] || exit "$status"
-
-bash -n "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh || exit $?
-"$PROJECT_ROOT/scripts/crewboss" help >/dev/null || exit $?
-shellcheck "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh

@@ -125,13 +125,18 @@ do_focus() {
   herdr agent focus "$target" >/dev/null
 }
 
+close_crew() {
+  local name=$1
+  cb_pane_close "$(cb_reg_field "$name" pane)" "$name" ||
+    die "could not safely close '$name'"
+  cb_reg_put "$name" '{"status": "closed", "token": ""}' ||
+    die "could not update the crew registry"
+}
+
 do_close() {
   require_crew "$1"
   [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is already closed"
-  cb_pane_close "$(cb_reg_field "$1" pane)" "$1" ||
-    die "could not safely close '$1'"
-  cb_reg_put "$1" '{"status": "closed", "token": ""}' ||
-    die "could not update the crew registry"
+  close_crew "$1"
   echo "closed $1 (worktree and conversation kept; crewboss open $1 to resume)"
 }
 
@@ -163,10 +168,7 @@ do_remove() {
     die "refusing to remove '$name'"
 
   if [ "$(cb_reg_field "$name" status)" = open ]; then
-    cb_pane_close "$(cb_reg_field "$name" pane)" "$name" ||
-      die "could not safely close '$name'"
-    cb_reg_put "$name" '{"status": "closed", "token": ""}' ||
-      die "could not update the crew registry"
+    close_crew "$name"
   fi
 
   cb_tree_check_remove "$branch" "$path" "$force" ||
@@ -188,12 +190,7 @@ case $cmd in
   focus)  [ $# -ge 1 ] || die "usage: crewboss focus <name>"; do_focus "$1" ;;
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
   open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
-  remove)
-    if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-      die "usage: crewboss remove <name> [-f]"
-    fi
-    do_remove "$@"
-    ;;
+  remove) do_remove "$@" ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;
 esac
