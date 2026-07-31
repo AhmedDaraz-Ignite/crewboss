@@ -139,11 +139,30 @@ do_open() {
 }
 
 do_remove() {
-  local name=$1 force=${2:-}
+  [ $# -ge 1 ] && [ $# -le 2 ] ||
+    die "usage: crewboss remove <name> [-f]"
+  local name=$1 force=${2:-} branch path
+  [ -z "$force" ] || [ "$force" = -f ] ||
+    die "usage: crewboss remove <name> [-f]"
+
   require_crew "$name"
-  [ "$(cb_reg_field "$name" status)" = open ] && cb_pane_close "$(cb_reg_field "$name" pane)"
-  cb_tree_remove "$(cb_reg_field "$name" branch)" "$force" || die "worktree removal failed (dirty? add -f)"
-  cb_reg_del "$name"
+  branch=$(cb_reg_field "$name" branch)
+  path=$(cb_reg_field "$name" path)
+  cb_tree_check_remove "$branch" "$path" "$force" ||
+    die "refusing to remove '$name'"
+
+  if [ "$(cb_reg_field "$name" status)" = open ]; then
+    cb_pane_close "$(cb_reg_field "$name" pane)" "$name" ||
+      die "could not safely close '$name'"
+    cb_reg_put "$name" '{"status": "closed", "token": ""}' ||
+      die "could not update the crew registry"
+  fi
+
+  cb_tree_check_remove "$branch" "$path" "$force" ||
+    die "'$name' changed while closing; worktree kept (crewboss open $name)"
+  cb_tree_remove "$branch" "$force" ||
+    die "worktree removal failed; crew kept closed (crewboss open $name)"
+  cb_reg_del "$name" || die "worktree removed but registry cleanup failed"
   echo "removed $name"
 }
 
@@ -158,7 +177,11 @@ case $cmd in
   focus)  [ $# -ge 1 ] || die "usage: crewboss focus <name>"; do_focus "$1" ;;
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
   open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
-  remove) [ $# -ge 1 ] || die "usage: crewboss remove <name> [-f]"; do_remove "$@" ;;
+  remove)
+    [ $# -ge 1 ] && [ $# -le 2 ] ||
+      die "usage: crewboss remove <name> [-f]"
+    do_remove "$@"
+    ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;
 esac
