@@ -7,6 +7,7 @@ CB_REG_LOCK="$CB_STATE_DIR/crew.lock"
 CB_LOCK_OWNER_LOCK=
 CB_LOCK_OWNER_ANCHOR=
 CB_LOCK_OWNER_TICKET=
+CB_LOCK_OWNER_PID=
 
 _cb_lock_parse_chooser() {
   local name=${1##*/} rest
@@ -64,6 +65,7 @@ cb_lock_acquire() {
   [ -z "${CB_LOCK_OWNER_LOCK:-}" ] || return 1
   [ -z "${CB_LOCK_OWNER_ANCHOR:-}" ] || return 1
   [ -z "${CB_LOCK_OWNER_TICKET:-}" ] || return 1
+  [ -z "${CB_LOCK_OWNER_PID:-}" ] || return 1
 
   old_umask=$(umask) || return 1
   umask 077
@@ -174,6 +176,7 @@ cb_lock_acquire() {
   CB_LOCK_OWNER_LOCK=$lock
   CB_LOCK_OWNER_ANCHOR=$anchor
   CB_LOCK_OWNER_TICKET=$ticket_path
+  CB_LOCK_OWNER_PID=$pid
 }
 
 cb_lock_release() {
@@ -181,8 +184,13 @@ cb_lock_release() {
   local owner_lock=${CB_LOCK_OWNER_LOCK:-}
   local anchor=${CB_LOCK_OWNER_ANCHOR:-}
   local ticket=${CB_LOCK_OWNER_TICKET:-}
+  local owner_pid=${CB_LOCK_OWNER_PID:-} anchor_pid token
 
   [ "$owner_lock" = "$lock" ] || return 1
+  case $owner_pid in
+    ''|0|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#owner_pid}" -le 18 ] || return 1
   case $anchor in
     "$claims"/.id.*) ;;
     *) return 1 ;;
@@ -191,11 +199,20 @@ cb_lock_release() {
     "$claims"/T.*.*.*) ;;
     *) return 1 ;;
   esac
+  anchor_pid=
+  IFS= read -r anchor_pid < "$anchor" || return 1
+  [ "$anchor_pid" = "$owner_pid" ] || return 1
+  _cb_lock_parse_ticket "$ticket" || return 1
+  [ "$CB_LOCK_PARSE_PID" = "$owner_pid" ] || return 1
+  token=${anchor##*.}
+  [ "$CB_LOCK_PARSE_TOKEN" = "$token" ] || return 1
+  sh -c '[ "$PPID" = "$1" ]' sh "$owner_pid" 2>/dev/null || return 1
 
   rmdir "$ticket" 2>/dev/null || return 1
   CB_LOCK_OWNER_LOCK=
   CB_LOCK_OWNER_ANCHOR=
   CB_LOCK_OWNER_TICKET=
+  CB_LOCK_OWNER_PID=
   rm -f "$anchor" 2>/dev/null
 }
 
