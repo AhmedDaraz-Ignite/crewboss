@@ -12,6 +12,6 @@ done
 
 [ "$status" -eq 0 ] || exit "$status"
 
-bash -n "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh
-"$PROJECT_ROOT/scripts/crewboss" help >/dev/null
+bash -n "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh || exit $?
+"$PROJECT_ROOT/scripts/crewboss" help >/dev/null || exit $?
 shellcheck "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh
