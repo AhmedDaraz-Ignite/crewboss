@@ -38,10 +38,11 @@ _cb_agent_shell_quote() {
 cb_agent_prompt() {
   local name=$1 task=$2 crew_id=$3 run_id=$4 tool_path=$5 state_dir=$6
   local target tries=0 marker prompt q_name q_crew_id q_run_id q_tool q_state
-  local payload_nonce blocked_delimiter done_delimiter
+  local payload_nonce payload_suffix blocked_delimiter done_delimiter
   target=$(cb_agent_target "$name") || return 1
   marker="CrewBoss run id: $run_id"
   payload_nonce="${RANDOM}_${RANDOM}_${RANDOM}"
+  payload_suffix="CREWBOSS_PAYLOAD_SUFFIX_$payload_nonce"
   blocked_delimiter="CREWBOSS_BLOCKED_PAYLOAD_$payload_nonce"
   done_delimiter="CREWBOSS_DONE_PAYLOAD_$payload_nonce"
   q_name=$(_cb_agent_shell_quote "$name") || return 1
@@ -53,19 +54,29 @@ cb_agent_prompt() {
 
 $marker
 
-Use CrewBoss events to report this run. Put the message between the opening and closing delimiter. Keep the single quotes around the opening delimiter so shell syntax in the message stays inert. If the message contains the closing delimiter on a line by itself, append _X to both occurrences of that example's delimiter before running it.
+Use CrewBoss events to report this run. Put the exact message between the opening and closing delimiter. Keep the single quotes around the opening delimiter so shell syntax in the message stays inert. If the message contains the closing delimiter on a line by itself, append _X to both delimiter occurrences. Leave the suffix and cleanup lines unchanged; they preserve intentional trailing newlines.
 
 When you need an answer, emit the exact question before waiting:
-CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id blocked \"\$(cat <<'$blocked_delimiter'
+CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'$blocked_delimiter'
 the exact question
 $blocked_delimiter
+printf '%s' '$payload_suffix'
 )\"
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%$payload_suffix}
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%\$'\\n'}
+CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id blocked \"\$CREWBOSS_EVENT_PAYLOAD\"
+unset CREWBOSS_EVENT_PAYLOAD
 
 When the work is complete, emit the final answer before ending:
-CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id done \"\$(cat <<'$done_delimiter'
+CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'$done_delimiter'
 the final answer
 $done_delimiter
-)\""
+printf '%s' '$payload_suffix'
+)\"
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%$payload_suffix}
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%\$'\\n'}
+CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id done \"\$CREWBOSS_EVENT_PAYLOAD\"
+unset CREWBOSS_EVENT_PAYLOAD"
 
   while :; do
     herdr agent prompt "$target" "$prompt" >/dev/null || return 1

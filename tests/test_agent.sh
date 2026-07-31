@@ -74,27 +74,28 @@ reset_agent_fake() {
 }
 
 extract_prompt_example() {
-  local prompt=$1 kind=$2 line opener delimiter='' collecting=0 saw_delimiter=0 output=''
-  opener=" $kind \"\$(cat <<'"
+  local prompt=$1 kind=$2 line prefix opener collecting=0 saw_emit=0 output=''
+  case $kind in
+    blocked) prefix=CREWBOSS_BLOCKED_PAYLOAD_ ;;
+    done) prefix=CREWBOSS_DONE_PAYLOAD_ ;;
+    *) return 1 ;;
+  esac
+  opener="CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'$prefix"
   while IFS= read -r line; do
     if [ "$collecting" -eq 0 ]; then
       case $line in
-        *"$opener"*)
-          delimiter=${line##* }
-          delimiter=${delimiter#"<<'"}
-          delimiter=${delimiter%"'"}
-          [ -n "$delimiter" ] || return 1
-          collecting=1
-          ;;
+        "$opener"*) collecting=1 ;;
         *) continue ;;
       esac
     fi
     output="$output${output:+$'\n'}$line"
-    if [ "$saw_delimiter" -eq 1 ] && [ "$line" = ')"' ]; then
+    case $line in
+      *" $kind \"\$CREWBOSS_EVENT_PAYLOAD\"") saw_emit=1 ;;
+    esac
+    if [ "$saw_emit" -eq 1 ] && [ "$line" = 'unset CREWBOSS_EVENT_PAYLOAD' ]; then
       printf '%s' "$output"
       return 0
     fi
-    [ "$line" != "$delimiter" ] || saw_delimiter=1
   done <<< "$prompt"
   return 1
 }
@@ -208,10 +209,19 @@ test_prompt_teaches_the_shell_safe_event_protocol() {
   assert_contains "$prompt" "do the exact task" || return 1
   assert_contains "$prompt" "CrewBoss run id: run-456" || return 1
   assert_contains "$prompt" \
-    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 blocked \"\$(cat <<'CREWBOSS_BLOCKED_PAYLOAD_" || return 1
+    "CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'CREWBOSS_BLOCKED_PAYLOAD_" || return 1
   assert_contains "$prompt" \
-    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 done \"\$(cat <<'CREWBOSS_DONE_PAYLOAD_" || return 1
-  assert_contains "$prompt" "Put the message between the opening and closing delimiter" || return 1
+    "CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'CREWBOSS_DONE_PAYLOAD_" || return 1
+  assert_contains "$prompt" "printf '%s' 'CREWBOSS_PAYLOAD_SUFFIX_" || return 1
+  assert_contains "$prompt" \
+    "CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%CREWBOSS_PAYLOAD_SUFFIX_" || return 1
+  assert_contains "$prompt" \
+    "CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%\$'\\n'}" || return 1
+  assert_contains "$prompt" \
+    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 blocked \"\$CREWBOSS_EVENT_PAYLOAD\"" || return 1
+  assert_contains "$prompt" \
+    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 done \"\$CREWBOSS_EVENT_PAYLOAD\"" || return 1
+  assert_contains "$prompt" "Put the exact message between the opening and closing delimiter" || return 1
   assert_contains "$prompt" "the exact question" || return 1
   assert_contains "$prompt" "the final answer" || return 1
   assert_contains "$prompt" "emit the exact question before waiting" || return 1
@@ -275,6 +285,42 @@ second line with \$(touch $fixture/payload-second) and \\backslash"
   [ ! -e "$fixture/payload-backtick" ] || return 1
   [ ! -e "$fixture/payload-semicolon" ] || return 1
   [ ! -e "$fixture/payload-second" ]
+}
+
+test_prompt_event_examples_preserve_trailing_newlines() {
+  reset_agent_fake prompt
+  local fixture tool log prompt example command zero one multiple
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' RETURN
+  tool="$fixture/crewboss"
+  log="$fixture/events.jsonl"
+  cat > "$tool" <<'TOOL'
+#!/bin/bash
+jq -cn --args '{args: $ARGS.positional}' -- "$@" >> "$EVENT_LOG"
+TOOL
+  chmod +x "$tool"
+
+  cb_agent_prompt SMOKE-100 "do the exact task" crew-123 run-456 \
+    "$tool" "$fixture/state" >/dev/null || return 1
+  prompt=$(cat "$PROMPT_TEXT")
+  example=$(extract_prompt_example "$prompt" blocked) || return 1
+  zero='zero trailing newlines'
+  one=$'one trailing newline\n'
+  multiple=$'three trailing newlines\n\n\n'
+
+  command=$(replace_prompt_payload "$example" "the exact question" "$zero") || return 1
+  EVENT_LOG="$log" /bin/bash -c "$command" || return 1
+  command=$(replace_prompt_payload "$example" "the exact question" "$one") || return 1
+  EVENT_LOG="$log" /bin/bash -c "$command" || return 1
+  command=$(replace_prompt_payload "$example" "the exact question" "$multiple") || return 1
+  EVENT_LOG="$log" /bin/bash -c "$command" || return 1
+
+  jq -s -e --arg zero "$zero" --arg one "$one" --arg multiple "$multiple" '
+    length == 3 and
+    .[0].args == ["emit","SMOKE-100","crew-123","run-456","blocked",$zero] and
+    .[1].args == ["emit","SMOKE-100","crew-123","run-456","blocked",$one] and
+    .[2].args == ["emit","SMOKE-100","crew-123","run-456","blocked",$multiple]
+  ' "$log" >/dev/null
 }
 
 test_prompt_delivery_retries_until_the_fifth_attempt() {
@@ -357,6 +403,8 @@ run_test "prompts an agent with the internal target" test_prompt_send_uses_inter
 run_test "confirms a prompt with the internal target" test_prompt_confirmation_read_uses_internal_target
 run_test "teaches crews the shell-safe event protocol" test_prompt_teaches_the_shell_safe_event_protocol
 run_test "keeps hostile values inert in executable event examples" test_prompt_event_examples_execute_with_hostile_values
+run_test "preserves zero one and multiple trailing payload newlines" \
+  test_prompt_event_examples_preserve_trailing_newlines
 run_test "retries prompt delivery through the fifth attempt" test_prompt_delivery_retries_until_the_fifth_attempt
 run_test "reads an agent with the internal target" test_general_read_uses_internal_target
 run_test "explains an agent with the internal target" test_state_uses_internal_target
