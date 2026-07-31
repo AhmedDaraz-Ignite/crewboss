@@ -4,7 +4,7 @@
 
 CrewBoss must supervise several crews through events.
 
-A crew must not notify CrewBoss by changing screen text. It must append an event to one shared log file. CrewBoss reads that file in FIFO order. FIFO means the oldest inserted event is processed first.
+A crew must not notify CrewBoss by changing screen text. It must append an event to one shared append-only log. CrewBoss reads events in strict FIFO insertion order and acts. FIFO means the oldest inserted event first.
 
 ## Simple flow
 
@@ -47,7 +47,7 @@ The fields mean:
 
 CrewBoss assigns `seq`, `event_id`, and `time`. The crew cannot choose them.
 
-One portable `mkdir` lock protects sequence assignment and append. The next sequence comes from the last complete log line. Therefore physical line order and sequence order are the same. Concurrent crews cannot merge or overwrite lines.
+A portable bakery lock protects sequence assignment and append. Each process creates a chooser claim, then a numbered ticket claim, under the lock's claims directory. Live claims wait by ticket order. `mkdir` creates the claims, but this is not a simple `mkdir` mutex. The next sequence comes from the last complete log line. Therefore physical line order and sequence order are the same. Concurrent crews cannot merge or overwrite lines.
 
 ## Crew protocol
 
@@ -69,9 +69,9 @@ crewboss emit CREW CREW_ID RUN_ID done "the final answer"
 
 The real prompt also sets the exact `CB_STATE_DIR` and uses the absolute CrewBoss path.
 
-When the crew needs an answer, it appends `blocked` and waits. When it finishes, it appends `done`. The event append is the notification. New runs do not use a screen sentinel.
+When the crew needs an answer, it appends `blocked` and waits. When it finishes, it appends `done`. The event append is the notification. Screen text is not a notification.
 
-The existing retry that starts a new Herdr agent remains. The existing retry that confirms prompt delivery also remains. Only its confirmation marker changes from a completion token to the unique `run_id`.
+The existing retry that starts a new Herdr agent remains. The existing retry that confirms prompt delivery also remains. It confirms the unique `run_id` marker.
 
 ## FIFO reading
 
@@ -152,14 +152,14 @@ The public wait command becomes:
 crewboss wait <name>...
 ```
 
-It returns:
+The first output line is the crew name and event kind. The exact payload follows and can use more than one line. A simple blocked event looks like this:
 
 ```text
 ABC-123 blocked
 Which database should I use?
 ```
 
-or:
+A simple done event looks like this:
 
 ```text
 ABC-123 done
@@ -168,7 +168,13 @@ The pull request is ready.
 
 `emit` is an internal command used by crews. It still validates all names, identities, kinds, and payloads before appending.
 
-`list` shows the endpoint state, task state, branch, and a short task summary. The full task remains in `crew.json`.
+`list` prints these exact headers:
+
+```text
+NAME ENDPOINT TASK BRANCH SUMMARY
+```
+
+`ENDPOINT` is `open`, `closed`, or `unknown`. `TASK` is `running`, `blocked`, `done`, or `unknown`. `SUMMARY` uses the stored initial task. The exact initial task and latest prompt remain in `crew.json`.
 
 ## Compatibility
 

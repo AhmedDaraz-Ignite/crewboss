@@ -1,6 +1,6 @@
 ---
 name: crewboss
-description: Spawn isolated agent sessions (Claude, Codex, or any herdr-supported agent) in dedicated git worktrees and drive them from the current session - spawn a crew on a task, wait for completion without spending tokens, read its reply, jump to its pane, close and later resume it. Use when the user asks to spawn a crew, delegate a task to a parallel agent session, orchestrate work across worktrees, or says "crewboss".
+description: Spawn and supervise isolated agent sessions (Claude, Codex, or any herdr-supported agent) in dedicated git worktrees. Use when the user asks to spawn a crew, delegate a task to a parallel agent session, work on several tasks in parallel, orchestrate work across worktrees, wait for blocked or done crew events, or says "crewboss".
 ---
 
 # crewboss
@@ -8,7 +8,7 @@ description: Spawn isolated agent sessions (Claude, Codex, or any herdr-supporte
 crewboss turns the current session into an orchestrator (a "First Mate"): it spawns
 crew sessions, each in its own git worktree with its own agent process, visible as a
 pane in the herdr terminal multiplexer. The human can watch and click between crews;
-the orchestrator prompts, waits, reads, and relays.
+the orchestrator prompts, waits for events, reads screen snapshots, and relays questions.
 
 ## Resolve the bundled tool
 
@@ -28,13 +28,14 @@ Requirements (fail loudly if missing, do not improvise around them):
 
 ## The interface
 
-Every command takes a crew name - never a pane id, a path, or a timeout:
+Every command that targets a crew takes a crew name. `wait` takes one or more names.
+Never type a pane ID, path, or timeout:
 
 ```bash
 "$CREWBOSS" spawn <task...>    # start a crew on a task (--in tab|space|split, --agent KIND, --branch NAME)
-"$CREWBOSS" list               # every crew: name, state, branch, pane
+"$CREWBOSS" list               # columns: NAME ENDPOINT TASK BRANCH SUMMARY
 "$CREWBOSS" send  <name> <text...>
-"$CREWBOSS" wait  <name>       # block until the crew reports done, then print its reply
+"$CREWBOSS" wait  <name>...    # first selected blocked or done event
 "$CREWBOSS" read  <name> [lines]
 "$CREWBOSS" focus <name>       # jump herdr to that crew's pane
 "$CREWBOSS" close <name>       # pane goes away; worktree and conversation are kept
@@ -57,30 +58,66 @@ in separate worktrees.
 
 ## Rules for the orchestrating agent
 
-1. **Waiting must cost zero tokens.** `wait` is one blocking shell call; issue it and
-   let the process sleep. Never poll `list` in a model-driven loop - every check is a
-   full model turn.
-2. **A task is just text.** Plain instructions, a skill invocation like
+1. **Spawn all crews before waiting.** Then issue one blocking call such as
+   `wait A B C`. Do not start one crew and wait before starting the others.
+2. **Handle `blocked`.** Relay the exact question to the user. Use `send NAME ANSWER`
+   to give the answer to the crew. Then wait again.
+3. **Handle `done`.** Act on the final answer. Review, integrate, or report it as the
+   task requires. Then wait again for any crews that still run.
+4. **A task is just text.** Plain instructions, a skill invocation like
    `/deliver-ticket ABC-123`, or both. It lands in the crew's input box verbatim, so
    skills load in the crew's context, not the orchestrator's.
-3. **A read is a screen snapshot, not a transcript.** Read generously (default 200
-   lines) and grep for what you expect rather than trusting the tail.
-4. **Prefer `close` over `remove`** when the work might continue - closing costs
+5. **`wait` is the Phase 1 listener.** It blocks in one foreground shell process.
+   There is no task timeout or background watcher. Do not poll `list`, `read`, or crew
+   screens for notifications.
+6. **A read is a screen snapshot, not a transcript or notification.** Read generously
+   (default 200 lines) and grep for what you expect rather than trusting the tail.
+7. **Prefer `close` over `remove`** when the work might continue - closing costs
    nothing (the worktree keeps the files, `open` resumes the conversation), removing
    deletes the worktree.
-5. **Do not invent discard authority.** If normal `remove` refuses, report why. Do not
+8. **Do not invent discard authority.** If normal `remove` refuses, report why. Do not
    retry with `-f` unless the human explicitly authorized discarding local work.
-6. **If `wait` times out**, the crew is still going or stuck: `read` it, and if it is
-   blocked on a question, `focus` it and tell the human, or `send` the answer.
+
+## Events and state
+
+Every crew appends `blocked` and `done` events to one shared append-only log. CrewBoss
+reads them in strict FIFO insertion order and acts. FIFO means the oldest inserted event
+first. Events for crews outside the current `wait` stay pending.
+
+The first output line is the crew name and event kind. The exact payload follows. It can
+use more than one line. A simple blocked event looks like this:
+
+```text
+ABC-123 blocked
+Which database should I use?
+```
+
+A simple done event looks like this:
+
+```text
+ABC-123 done
+The pull request is ready.
+```
+
+Delivery is at least once after a crash. An event can appear again, but an appended
+event is not lost.
+
+`list` prints `NAME ENDPOINT TASK BRANCH SUMMARY`. Endpoint values are `open`, `closed`,
+and `unknown`. Task values are `running`, `blocked`, `done`, and `unknown`. `SUMMARY`
+uses the stored initial task. `crew.json` stores the exact initial task and latest prompt.
+`events.jsonl` is the append-only event source. `event-state.json` stores the read cursor
+and pending checkpoint.
 
 ## Typical flow
 
 ```bash
 "$CREWBOSS" spawn "ABC-123 make the footer sticky"
-"$CREWBOSS" wait ABC-123        # zero-token block; prints the crew's reply
-# follow-ups in the same conversation:
-"$CREWBOSS" send ABC-123 "also fix the mobile layout"
-"$CREWBOSS" wait ABC-123
+"$CREWBOSS" spawn "ABC-124 fix the login redirect"
+"$CREWBOSS" spawn "ABC-125 add an export button"
+"$CREWBOSS" wait ABC-123 ABC-124 ABC-125
+# If the result is blocked, relay the exact question, then:
+"$CREWBOSS" send ABC-124 "Yes, guests should see the login page."
+"$CREWBOSS" wait ABC-123 ABC-124 ABC-125
 # done for now, keep the conversation resumable:
 "$CREWBOSS" close ABC-123
 ```
