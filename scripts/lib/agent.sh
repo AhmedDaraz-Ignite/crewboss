@@ -15,11 +15,12 @@ cb_agent_args() {
 
 # A just-created pane reports agent_pane_busy until its shell finishes starting, so retry.
 cb_agent_start() {
-  local name=$1 kind=$2 pane=$3 mode=${4:-fresh} extra out tries=0
+  local name=$1 kind=$2 pane=$3 mode=${4:-fresh} extra out target tries=0
+  target=$(cb_agent_target "$name") || return 1
   extra=$(cb_agent_args "$kind" "$mode")
   while :; do
     # shellcheck disable=SC2086
-    out=$(herdr agent start "$name" --kind "$kind" --pane "$pane" --timeout "$CB_START_TIMEOUT_MS" \
+    out=$(herdr agent start "$target" --kind "$kind" --pane "$pane" --timeout "$CB_START_TIMEOUT_MS" \
       ${extra:+-- $extra} 2>&1) && return 0
     if printf '%s' "$out" | grep -q agent_pane_busy && [ $((tries += 1)) -lt 15 ]; then
       sleep 1; continue
@@ -34,13 +35,14 @@ cb_agent_start() {
 # A freshly started agent can silently swallow the first prompt, so confirm the text
 # actually echoed in the pane and resend if it did not.
 cb_agent_prompt() {
-  local name=$1 task=$2 tok=TASKDONE num=$RANDOM tries=0
+  local name=$1 task=$2 tok=TASKDONE num=$RANDOM target tries=0
+  target=$(cb_agent_target "$name") || return 1
   while :; do
-    herdr agent prompt "$name" "$task
+    herdr agent prompt "$target" "$task
 
 When you are completely finished, print on its own final line the word $tok followed immediately by the digits $num, with no space between them." >/dev/null || return 1
     sleep 2
-    if herdr agent read "$name" --source recent-unwrapped --lines 120 2>/dev/null \
+    if herdr agent read "$target" --source recent-unwrapped --lines 120 2>/dev/null \
         | grep -q "digits $num"; then
       printf '%s%s' "$tok" "$num"
       return 0
@@ -59,9 +61,13 @@ cb_agent_wait() {
 
 # A read is a screen snapshot, not a transcript - read generously.
 cb_agent_read() {
-  herdr agent read "$1" --source recent-unwrapped --lines "${2:-200}"
+  local target
+  target=$(cb_agent_target "$1") || return 1
+  herdr agent read "$target" --source recent-unwrapped --lines "${2:-200}"
 }
 
 cb_agent_state() {
-  herdr agent explain "$1" 2>/dev/null | sed -n 's/^state: //p'
+  local target
+  target=$(cb_agent_target "$1") || return 1
+  herdr agent explain "$target" 2>/dev/null | sed -n 's/^state: //p'
 }

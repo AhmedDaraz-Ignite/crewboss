@@ -22,8 +22,9 @@ cb_pane_create() {
 }
 
 cb_pane_close() {
-  local pane=$1 name=$2 response status live
-  response=$(herdr agent get "$name" 2>&1)
+  local pane=$1 name=$2 response status live target
+  target=$(cb_agent_target "$name") || return 1
+  response=$(herdr agent get "$target" 2>&1)
   status=$?
 
   if [ "$status" -ne 0 ]; then

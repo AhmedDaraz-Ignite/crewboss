@@ -118,9 +118,11 @@ do_read() {
 }
 
 do_focus() {
+  local target
   require_crew "$1"
   [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is closed (crewboss open $1)"
-  herdr agent focus "$1" >/dev/null
+  target=$(cb_agent_target "$1") || return 1
+  herdr agent focus "$target" >/dev/null
 }
 
 do_close() {

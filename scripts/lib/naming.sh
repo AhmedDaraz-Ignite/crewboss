@@ -30,3 +30,15 @@ cb_name() {
   ticket=$(cb_ticket "$1")
   if [ -n "$ticket" ]; then printf '%s' "$ticket"; else cb_slug "$1"; fi
 }
+
+cb_agent_target() {
+  local target hash
+  target=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  if [[ $target =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+    printf '%s' "$target"
+    return
+  fi
+
+  hash=$(printf '%s' "$1" | git hash-object --stdin) || return 1
+  printf 'crew-%.27s' "$hash"
+}

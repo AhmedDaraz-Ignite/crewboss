@@ -795,6 +795,92 @@ git commit -m "docs: explain fail-closed crew cleanup"
 
 ---
 
+### Task 6A: Herdr-compatible internal agent targets
+
+The first disposable smoke test exposed an integration defect: public Jira crew
+names such as `SMOKE-100` are valid crewboss names, but Herdr 0.7.5 accepts only
+lowercase internal agent names. Keep the public name in the CLI, pane label, and
+registry. Derive one deterministic Herdr target at every `herdr agent` boundary.
+
+**Files:**
+
+- Modify: `scripts/lib/naming.sh`
+- Modify: `scripts/lib/agent.sh`
+- Modify: `scripts/lib/pane.sh`
+- Modify: `scripts/crewboss`
+- Create: `tests/test_agent.sh`
+- Modify: `tests/test_pane.sh`
+
+**Interfaces:**
+
+- Produces: `cb_agent_target(public_name) -> Herdr-compatible internal name`
+- Preserves valid existing lowercase agent names unchanged
+- Uses the same target for start, prompt, read, explain, get, and focus
+- Keeps public crew names unchanged in the registry and command output
+
+- [ ] **Step 1: Write failing adapter-boundary tests**
+
+Cover `SMOKE-100` at every Herdr agent command. Assert that Herdr receives
+`smoke-100`, while command output and registry lookup continue to use
+`SMOKE-100`. Cover a valid existing lowercase name and an invalid long name so
+the mapper is deterministic, starts with a lowercase letter, uses only Herdr's
+allowed characters, and is no longer than 32 characters.
+
+Run:
+
+```bash
+bash tests/test_agent.sh
+bash tests/test_pane.sh
+```
+
+Expected: the new uppercase cases fail before the adapter is implemented.
+
+- [ ] **Step 2: Implement one deterministic adapter**
+
+Add `cb_agent_target` to `scripts/lib/naming.sh`. Lowercase a public name when
+that produces a valid Herdr name. For names that still violate Herdr's
+lowercase-letter start, allowed-character, or 32-character rules, derive a
+stable `crew-<git-object-hash-prefix>` target. Do not store the internal target;
+all call sites must derive it from the public name.
+
+Use the adapter in:
+
+- `cb_agent_start`
+- both Herdr calls in `cb_agent_prompt`
+- `cb_agent_read`
+- `cb_agent_state`
+- `cb_pane_close`
+- `do_focus`
+
+Do not change pane labels, registry keys, public output, or the existing startup
+and prompt retry loops.
+
+- [ ] **Step 3: Run Task 6A checks**
+
+Run:
+
+```bash
+bash tests/test_agent.sh
+bash tests/test_pane.sh
+bash tests/run
+bash -n scripts/crewboss scripts/lib/*.sh tests/run tests/test_*.sh
+shellcheck scripts/crewboss scripts/lib/*.sh tests/run tests/test_*.sh
+git diff --check
+```
+
+Expected: all commands exit zero.
+
+- [ ] **Step 4: Commit Task 6A**
+
+```bash
+git add docs/superpowers/plans/2026-07-31-phase-0-trust.md \
+  scripts/lib/naming.sh scripts/lib/agent.sh scripts/lib/pane.sh \
+  scripts/crewboss tests/test_agent.sh tests/test_pane.sh
+git commit -m "fix: map crew names to herdr targets"
+```
+
+---
+
 ### Task 6: Final verification and disposable Herdr smoke test
 
 **Files:**
