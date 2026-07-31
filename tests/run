@@ -1,0 +1,12 @@
+#!/bin/bash
+set -u
+
+TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+status=0
+
+for test_file in "$TEST_ROOT"/test_*.sh; do
+  [ "$(basename "$test_file")" = test_helper.sh ] && continue
+  bash "$test_file" || status=1
+done
+
+exit "$status"

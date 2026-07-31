@@ -11,9 +11,28 @@ cb_base_ref() {
   printf '%s' "${head:-origin/main}"
 }
 
+cb_tree_primary_path() {
+  local worktrees
+  worktrees=$(git worktree list --porcelain) || return 1
+  printf '%s\n' "$worktrees" | sed -n 's/^worktree //p' | head -1
+}
+
 # Reuse an existing worktree for the branch, so a failed spawn can be retried.
 cb_tree_create() {
-  cb_tree_path "$1" 2>/dev/null && return 0
+  local existing primary
+  if existing=$(cb_tree_path "$1" 2>/dev/null); then
+    primary=$(cb_tree_primary_path) || return 1
+    [ -n "$primary" ] || {
+      echo "crewboss: could not identify the primary repo" >&2
+      return 1
+    }
+    [ "$existing" != "$primary" ] || {
+      echo "crewboss: '$1' is checked out in the primary repo, pick another branch" >&2
+      return 1
+    }
+    printf '%s' "$existing"
+    return 0
+  fi
   wt switch --create "$1" --base "$(cb_base_ref)" --no-cd >&2 || return 1
   cb_tree_path "$1"
 }
