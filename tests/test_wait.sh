@@ -115,6 +115,222 @@ assert_corrupt_checkpoint_fails_unchanged() {
   cmp -s "$TEST_TMP/crew.before" "$CB_REG"
 }
 
+test_spawn_persists_identity_before_prompt_and_keeps_an_immediate_event() {
+  local fixture bin state tree output status
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' RETURN
+  bin="$fixture/bin"
+  state="$fixture/state"
+  tree="$fixture/tree"
+  mkdir -p "$bin" "$state"
+
+  cat > "$bin/wt" <<'WT'
+#!/bin/bash
+case $1 in
+  list)
+    if [ -f "$TEST_TREE/.created" ]; then
+      jq -cn --arg path "$TEST_TREE" '[{branch:"test-ABC-123-immediate-task",path:$path}]'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  switch)
+    mkdir -p "$TEST_TREE"
+    : > "$TEST_TREE/.created"
+    ;;
+  *) exit 2 ;;
+esac
+WT
+
+  cat > "$bin/herdr" <<'HERDR'
+#!/bin/bash
+case "$1 $2" in
+  "tab create")
+    printf '{"result":{"root_pane":{"pane_id":"w1:p1"}}}\n'
+    ;;
+  "agent start") ;;
+  "agent prompt")
+    jq -e --arg name ABC-123 '
+      .[$name].task == "ABC-123 immediate task" and
+      .[$name].latest_prompt == "ABC-123 immediate task" and
+      (.[$name].crew_id | type == "string" and startswith("crew-")) and
+      (.[$name].run_id | type == "string" and startswith("run-")) and
+      .[$name].status == "open" and .[$name].task_status == "running" and
+      (.[$name] | has("token") | not)
+    ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 70
+    crew_id=$(jq -r '.["ABC-123"].crew_id' "$CB_STATE_DIR/crew.json") || exit 71
+    run_id=$(jq -r '.["ABC-123"].run_id' "$CB_STATE_DIR/crew.json") || exit 72
+    printf '%s\n' "$4" > "$TEST_PROMPT"
+    printf '%s\n' "$4" | grep -Fq "CrewBoss run id: $run_id" || exit 73
+    "$CREWBOSS" emit ABC-123 "$crew_id" "$run_id" done "immediate result" || exit 74
+    "$CREWBOSS" wait ABC-123 > "$TEST_IMMEDIATE_OUTPUT" || exit 75
+    ;;
+  "agent read")
+    sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT"
+    ;;
+  *) exit 2 ;;
+esac
+HERDR
+
+  cat > "$bin/sleep" <<'SLEEP'
+#!/bin/bash
+exit 0
+SLEEP
+  chmod +x "$bin/herdr" "$bin/sleep" "$bin/wt"
+
+  output=$(PATH="$bin:$PATH" CB_STATE_DIR="$state" CB_PREFIX=test \
+    HERDR_WORKSPACE_ID=w1 TEST_TREE="$tree" TEST_PROMPT="$fixture/prompt" \
+    TEST_IMMEDIATE_OUTPUT="$fixture/immediate.out" CREWBOSS="$CREWBOSS" \
+    "$CREWBOSS" spawn "ABC-123 immediate task" 2>&1)
+  status=$?
+
+  assert_eq 0 "$status" || return 1
+  assert_contains "$output" "spawned ABC-123" || return 1
+  assert_eq $'ABC-123 done\nimmediate result' \
+    "$(cat "$fixture/immediate.out")" || return 1
+  jq -e '.["ABC-123"] as $crew |
+    $crew.task == "ABC-123 immediate task" and
+    $crew.latest_prompt == "ABC-123 immediate task" and
+    $crew.task_status == "done" and $crew.blocked == false and
+    $crew.message == "immediate result" and $crew.last_event_seq == 1
+  ' "$state/crew.json" >/dev/null
+}
+
+setup_send_cli() {
+  SEND_TMP=$(mktemp -d)
+  SEND_BIN="$SEND_TMP/bin"
+  SEND_STATE="$SEND_TMP/state"
+  mkdir -p "$SEND_BIN" "$SEND_STATE"
+  : > "$SEND_TMP/herdr.log"
+
+  cat > "$SEND_BIN/herdr" <<'HERDR'
+#!/bin/bash
+case "$1 $2" in
+  "agent prompt")
+    printf 'prompt\n' >> "$TEST_HERDR_LOG"
+    printf '%s\n' "$4" > "$TEST_PROMPT_FILE"
+    jq -e --arg name "$TEST_CREW" --arg prompt "$TEST_NEW_PROMPT" \
+      --arg old_run "$TEST_OLD_RUN" '
+      .[$name].latest_prompt == $prompt and
+      (.[$name].crew_id | type == "string" and startswith("crew-")) and
+      (.[$name].run_id | type == "string" and startswith("run-") and . != $old_run)
+    ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 70
+    if [ "$TEST_RECORD_MODE" = phase1 ]; then
+      jq -e --arg name "$TEST_CREW" '
+        .[$name].crew_id == "crew-a" and .[$name].task_status == "blocked" and
+        .[$name].blocked == true and .[$name].message == "old question"
+      ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 71
+    else
+      jq -e --arg name "$TEST_CREW" '
+        (.[$name] | has("task_status") | not) and (.[$name] | has("task") | not)
+      ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 72
+    fi
+    if [ "$TEST_PROMPT_MODE" = immediate ]; then
+      crew_id=$(jq -r --arg name "$TEST_CREW" '.[$name].crew_id' "$CB_STATE_DIR/crew.json") || exit 73
+      run_id=$(jq -r --arg name "$TEST_CREW" '.[$name].run_id' "$CB_STATE_DIR/crew.json") || exit 74
+      "$CREWBOSS" emit "$TEST_CREW" "$crew_id" "$run_id" done "immediate follow-up" || exit 75
+      "$CREWBOSS" wait "$TEST_CREW" > "$TEST_IMMEDIATE_OUTPUT" || exit 76
+    fi
+    ;;
+  "agent read")
+    if [ "$TEST_PROMPT_MODE" != fail ]; then
+      sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT_FILE"
+    else
+      printf 'prompt still not visible\n'
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+HERDR
+
+  cat > "$SEND_BIN/sleep" <<'SLEEP'
+#!/bin/bash
+exit 0
+SLEEP
+  chmod +x "$SEND_BIN/herdr" "$SEND_BIN/sleep"
+}
+
+write_phase1_send_record() {
+  jq -n '{A:{branch:"feature",path:"/tmp/tree",pane:"w1:p1",agent:"claude",
+    placement:"tab",token:"",status:"open",task:"initial task",
+    latest_prompt:"initial task",crew_id:"crew-a",run_id:"run-old",
+    task_status:"blocked",blocked:true,message:"old question",last_event_seq:0}}' \
+    > "$SEND_STATE/crew.json"
+}
+
+write_legacy_send_record() {
+  jq -n '{A:{branch:"feature",path:"/tmp/tree",pane:"w1:p1",agent:"claude",
+    placement:"tab",token:"",status:"open"}}' > "$SEND_STATE/crew.json"
+}
+
+run_send_cli() {
+  PATH="$SEND_BIN:$PATH" CB_STATE_DIR="$SEND_STATE" CREWBOSS="$CREWBOSS" \
+    TEST_HERDR_LOG="$SEND_TMP/herdr.log" TEST_PROMPT_FILE="$SEND_TMP/prompt" \
+    TEST_IMMEDIATE_OUTPUT="$SEND_TMP/immediate.out" TEST_CREW=A \
+    TEST_NEW_PROMPT="follow-up answer" TEST_OLD_RUN="${TEST_OLD_RUN:-run-old}" \
+    TEST_RECORD_MODE="$TEST_RECORD_MODE" TEST_PROMPT_MODE="$TEST_PROMPT_MODE" \
+    "$CREWBOSS" send A "follow-up answer"
+}
+
+test_send_persists_new_run_before_prompt_without_clobbering_an_immediate_event() {
+  setup_send_cli
+  trap 'rm -rf "$SEND_TMP"' RETURN
+  write_phase1_send_record
+  TEST_RECORD_MODE=phase1
+  TEST_PROMPT_MODE=immediate
+
+  local output status
+  output=$(run_send_cli 2>&1)
+  status=$?
+
+  assert_eq 0 "$status" || return 1
+  assert_contains "$output" "sent; crewboss wait A" || return 1
+  assert_eq $'A done\nimmediate follow-up' "$(cat "$SEND_TMP/immediate.out")" || return 1
+  jq -e '.A.crew_id == "crew-a" and .A.run_id != "run-old" and
+    .A.task == "initial task" and .A.latest_prompt == "follow-up answer" and
+    .A.task_status == "done" and .A.blocked == false and
+    .A.message == "immediate follow-up" and .A.last_event_seq == 1
+  ' "$SEND_STATE/crew.json" >/dev/null
+}
+
+test_failed_send_restores_the_complete_previous_record() {
+  setup_send_cli
+  trap 'rm -rf "$SEND_TMP"' RETURN
+  write_phase1_send_record
+  local before output status
+  before=$(jq -c '.A' "$SEND_STATE/crew.json") || return 1
+  TEST_RECORD_MODE=phase1
+  TEST_PROMPT_MODE=fail
+
+  output=$(run_send_cli 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] || return 1
+  assert_contains "$output" "could not send" || return 1
+  assert_eq 5 "$(grep -c '^prompt$' "$SEND_TMP/herdr.log")" || return 1
+  jq -e --argjson before "$before" '.A == $before' "$SEND_STATE/crew.json" >/dev/null
+}
+
+test_send_upgrades_a_legacy_record_without_losing_old_fields() {
+  setup_send_cli
+  trap 'rm -rf "$SEND_TMP"' RETURN
+  write_legacy_send_record
+  TEST_OLD_RUN=missing
+  TEST_RECORD_MODE=legacy
+  TEST_PROMPT_MODE=confirm
+
+  run_send_cli >/dev/null 2>&1 || return 1
+
+  jq -e '.A.branch == "feature" and .A.path == "/tmp/tree" and
+    .A.pane == "w1:p1" and .A.agent == "claude" and .A.placement == "tab" and
+    .A.status == "open" and (.A | has("task") | not) and
+    (.A.crew_id | type == "string" and startswith("crew-")) and
+    (.A.run_id | type == "string" and startswith("run-")) and
+    .A.latest_prompt == "follow-up answer" and .A.task_status == "running" and
+    .A.blocked == false and .A.message == "" and .A.last_event_seq == 0
+  ' "$SEND_STATE/crew.json" >/dev/null
+}
+
 test_wait_routes_global_fifo_and_keeps_unselected_events_across_restarts() {
   setup_wait || return 1
   write_event_source \
@@ -330,6 +546,14 @@ test_wait_prunes_a_stale_pending_run_before_listening() {
 
 run_test "wait routes global FIFO and keeps other crews across restarts" \
   test_wait_routes_global_fifo_and_keeps_unselected_events_across_restarts
+run_test "spawn persists identity before prompt and keeps an immediate event" \
+  test_spawn_persists_identity_before_prompt_and_keeps_an_immediate_event
+run_test "send persists a new run and keeps an immediate event" \
+  test_send_persists_new_run_before_prompt_without_clobbering_an_immediate_event
+run_test "a failed send restores the complete previous record" \
+  test_failed_send_restores_the_complete_previous_record
+run_test "send upgrades a legacy record without losing old fields" \
+  test_send_upgrades_a_legacy_record_without_losing_old_fields
 run_test "wait skips old crew and old run events" \
   test_wait_skips_old_crew_and_run_events
 run_test "a later current event replaces older pending state" \

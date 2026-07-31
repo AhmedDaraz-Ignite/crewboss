@@ -11,15 +11,19 @@ source "$PROJECT_ROOT/scripts/lib/naming.sh"
 source "$PROJECT_ROOT/scripts/lib/agent.sh"
 
 HERDR_LOG=$(mktemp)
-PROMPT_DIGITS=$(mktemp)
+PROMPT_TEXT=$(mktemp)
+PROMPT_ATTEMPTS=$(mktemp)
 HERDR_ENFORCE=
-trap 'rm -f "$HERDR_LOG" "$PROMPT_DIGITS"' EXIT
+HERDR_START_BUSY_COUNT=0
+PROMPT_VISIBLE_AFTER=1
+trap 'rm -f "$HERDR_LOG" "$PROMPT_TEXT" "$PROMPT_ATTEMPTS"' EXIT
 
 sleep() {
   :
 }
 
 herdr() {
+  local attempts=0
   if [ "$1" != agent ]; then
     return 2
   fi
@@ -31,13 +35,22 @@ herdr() {
 
   case $2 in
     start|prompt)
-      if [ "$2" = prompt ]; then
-        printf '%s' "$4" | sed -n 's/.*digits \([0-9][0-9]*\),.*/\1/p' > "$PROMPT_DIGITS"
+      if [ "$2" = start ]; then
+        attempts=$(grep -c '^start ' "$HERDR_LOG")
+        if [ "$attempts" -le "$HERDR_START_BUSY_COUNT" ]; then
+          printf 'agent_pane_busy\n' >&2
+          return 1
+        fi
+      else
+        printf '%s\n' "$4" > "$PROMPT_TEXT"
+        IFS= read -r attempts < "$PROMPT_ATTEMPTS" || attempts=0
+        printf '%s\n' $((attempts + 1)) > "$PROMPT_ATTEMPTS"
       fi
       ;;
     read)
-      if [ -s "$PROMPT_DIGITS" ]; then
-        printf 'digits %s\n' "$(cat "$PROMPT_DIGITS")"
+      IFS= read -r attempts < "$PROMPT_ATTEMPTS" || attempts=0
+      if [ "$attempts" -ge "$PROMPT_VISIBLE_AFTER" ]; then
+        sed -n '/^CrewBoss run id: /p' "$PROMPT_TEXT"
       else
         printf 'visible pane output\n'
       fi
@@ -53,8 +66,11 @@ herdr() {
 
 reset_agent_fake() {
   HERDR_ENFORCE=$1
+  HERDR_START_BUSY_COUNT=0
+  PROMPT_VISIBLE_AFTER=1
   : > "$HERDR_LOG"
-  : > "$PROMPT_DIGITS"
+  : > "$PROMPT_TEXT"
+  printf '0\n' > "$PROMPT_ATTEMPTS"
 }
 
 test_uppercase_public_name_maps_to_lowercase_target() {
@@ -114,10 +130,20 @@ test_start_uses_internal_target() {
   assert_contains "$(cat "$HERDR_LOG")" "start smoke-100"
 }
 
+test_start_retries_busy_pane_through_the_fifteenth_attempt() {
+  reset_agent_fake start
+  HERDR_START_BUSY_COUNT=14
+
+  cb_agent_start SMOKE-100 claude w1:p1 fresh || return 1
+
+  assert_eq 15 "$(grep -c '^start ' "$HERDR_LOG")"
+}
+
 test_prompt_send_uses_internal_target() {
   reset_agent_fake prompt
 
-  cb_agent_prompt SMOKE-100 "do the task" >/dev/null
+  cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
+    /tmp/crewboss /tmp/state >/dev/null || return 1
 
   assert_contains "$(cat "$HERDR_LOG")" "prompt smoke-100"
 }
@@ -125,9 +151,85 @@ test_prompt_send_uses_internal_target() {
 test_prompt_confirmation_read_uses_internal_target() {
   reset_agent_fake read
 
-  cb_agent_prompt SMOKE-100 "do the task" >/dev/null
+  cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
+    /tmp/crewboss /tmp/state >/dev/null || return 1
 
   assert_contains "$(cat "$HERDR_LOG")" "read smoke-100"
+}
+
+test_prompt_teaches_the_shell_safe_event_protocol() {
+  reset_agent_fake prompt
+  local output prompt
+
+  output=$(cb_agent_prompt SMOKE-100 "do the exact task" crew-123 run-456 \
+    "/tmp/CrewBoss tool's/bin/crewboss" "/tmp/state dir's") || return 1
+  prompt=$(cat "$PROMPT_TEXT")
+
+  assert_eq '' "$output" || return 1
+  assert_contains "$prompt" "do the exact task" || return 1
+  assert_contains "$prompt" "CrewBoss run id: run-456" || return 1
+  assert_contains "$prompt" \
+    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 blocked \"the exact question\"" || return 1
+  assert_contains "$prompt" \
+    "CB_STATE_DIR=/tmp/state\\ dir\\'s /tmp/CrewBoss\\ tool\\'s/bin/crewboss emit SMOKE-100 crew-123 run-456 done \"the final answer\"" || return 1
+  assert_contains "$prompt" "emit the exact question before waiting" || return 1
+  assert_contains "$prompt" "emit the final answer before ending" || return 1
+  assert_not_contains "$prompt" TASKDONE
+}
+
+test_prompt_event_examples_execute_with_hostile_values() {
+  reset_agent_fake prompt
+  HERDR_ENFORCE=
+  local fixture tool_dir tool state log name crew_id run_id prompt blocked_line done_line
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' RETURN
+  tool_dir="$fixture/CrewBoss tool's \$(touch $fixture/tool-injected)"
+  tool="$tool_dir/crewboss"
+  state="$fixture/state dir's \$(touch $fixture/state-injected)"
+  log="$fixture/events.jsonl"
+  name="Crew name's \$(touch $fixture/name-injected)"
+  crew_id="crew id's \$(touch $fixture/crew-injected)"
+  run_id="run id's \$(touch $fixture/run-injected)"
+  mkdir -p "$tool_dir" "$state"
+  cat > "$tool" <<'TOOL'
+#!/bin/bash
+jq -cn --arg state "$CB_STATE_DIR" --args \
+  '{state: $state, args: $ARGS.positional}' -- "$@" >> "$EVENT_LOG"
+TOOL
+  chmod +x "$tool"
+
+  cb_agent_prompt "$name" "do the exact task" "$crew_id" "$run_id" \
+    "$tool" "$state" >/dev/null || return 1
+  prompt=$(cat "$PROMPT_TEXT")
+  blocked_line=$(grep ' blocked "the exact question"$' <<< "$prompt") || return 1
+  done_line=$(grep ' done "the final answer"$' <<< "$prompt") || return 1
+
+  EVENT_LOG="$log" bash -c "$blocked_line" || return 1
+  EVENT_LOG="$log" bash -c "$done_line" || return 1
+
+  jq -s -e --arg state "$state" --arg name "$name" --arg crew_id "$crew_id" \
+    --arg run_id "$run_id" '
+      length == 2 and
+      .[0] == {state: $state,
+        args: ["emit", $name, $crew_id, $run_id, "blocked", "the exact question"]} and
+      .[1] == {state: $state,
+        args: ["emit", $name, $crew_id, $run_id, "done", "the final answer"]}
+    ' "$log" >/dev/null || return 1
+  [ ! -e "$fixture/tool-injected" ] || return 1
+  [ ! -e "$fixture/state-injected" ] || return 1
+  [ ! -e "$fixture/name-injected" ] || return 1
+  [ ! -e "$fixture/crew-injected" ] || return 1
+  [ ! -e "$fixture/run-injected" ]
+}
+
+test_prompt_delivery_retries_until_the_fifth_attempt() {
+  reset_agent_fake prompt
+  PROMPT_VISIBLE_AFTER=5
+
+  cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
+    /tmp/crewboss /tmp/state >/dev/null || return 1
+
+  assert_eq 5 "$(cat "$PROMPT_ATTEMPTS")"
 }
 
 test_general_read_uses_internal_target() {
@@ -195,8 +297,12 @@ run_test "uses a stable bounded hash target for a numeric-leading name" test_num
 run_test "uses a stable bounded hash target for a long name" test_long_name_uses_stable_bounded_hash_target
 run_test "keeps hash targets stable across repository object formats" test_hash_target_is_stable_across_repository_object_formats
 run_test "starts an agent with the internal target" test_start_uses_internal_target
+run_test "retries a busy pane through the fifteenth start attempt" test_start_retries_busy_pane_through_the_fifteenth_attempt
 run_test "prompts an agent with the internal target" test_prompt_send_uses_internal_target
 run_test "confirms a prompt with the internal target" test_prompt_confirmation_read_uses_internal_target
+run_test "teaches crews the shell-safe event protocol" test_prompt_teaches_the_shell_safe_event_protocol
+run_test "keeps hostile values inert in executable event examples" test_prompt_event_examples_execute_with_hostile_values
+run_test "retries prompt delivery through the fifth attempt" test_prompt_delivery_retries_until_the_fifth_attempt
 run_test "reads an agent with the internal target" test_general_read_uses_internal_target
 run_test "explains an agent with the internal target" test_state_uses_internal_target
 run_test "focuses the internal target through the public registry key" test_focus_uses_internal_target_and_public_registry_key

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# registry: one JSON file mapping crew name to branch, path, pane, agent kind, placement,
-# pending sentinel token, and open/closed status. This is what makes close and reopen possible.
+# registry: one JSON file mapping crew names to their worktree, agent, lifecycle, and task state.
+# This is what makes close and reopen possible.
 CB_STATE_DIR=${CB_STATE_DIR:-"$HOME/.local/state/crewboss"}
 CB_REG="$CB_STATE_DIR/crew.json"
 CB_REG_LOCK="$CB_STATE_DIR/crew.lock"
@@ -8,6 +8,7 @@ CB_LOCK_OWNER_LOCK=
 CB_LOCK_OWNER_ANCHOR=
 CB_LOCK_OWNER_TICKET=
 CB_LOCK_OWNER_PID=
+CB_REG_SEND_RECEIPT=
 
 _cb_lock_parse_chooser() {
   local name=${1##*/} rest
@@ -261,6 +262,131 @@ cb_reg_replace() {
   if [ "$status" -eq 0 ]; then
     jq --arg n "$1" --argjson v "$2" '.[$n] = $v' "$CB_REG" > "$tmp" &&
       chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
+  fi
+  [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
+  cb_lock_release "$CB_REG_LOCK" || status=1
+  return "$status"
+}
+
+cb_reg_send_begin() {
+  local name=$1 candidate_crew_id=$2 run_id=$3 prompt=$4
+  local before prepared crew_id baseline receipt tmp status=0
+  CB_REG_SEND_RECEIPT=
+  [ -n "$name" ] && [ -n "$candidate_crew_id" ] && [ -n "$run_id" ] || return 1
+
+  cb_reg_init || return 1
+  cb_lock_acquire "$CB_REG_LOCK" || return 1
+  jq -e 'type == "object"' "$CB_REG" >/dev/null || status=1
+  if [ "$status" -eq 0 ]; then
+    before=$(jq -cer --arg n "$name" '.[$n] // empty' "$CB_REG") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    jq -e '.status == "open"' <<< "$before" >/dev/null || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    crew_id=$(jq -r --arg candidate "$candidate_crew_id" '
+      if ((.crew_id? | type) == "string" and (.crew_id | length) > 0)
+      then .crew_id else $candidate end
+    ' <<< "$before") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    baseline=$(jq -r '
+      if ((.last_event_seq? | type) == "number" and
+          (.last_event_seq | floor) == .last_event_seq and .last_event_seq >= 0)
+      then .last_event_seq else 0 end
+    ' <<< "$before") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    prepared=$(jq -c --arg crew_id "$crew_id" --arg run_id "$run_id" \
+      --arg prompt "$prompt" \
+      '. + {crew_id: $crew_id, run_id: $run_id, latest_prompt: $prompt}' \
+      <<< "$before") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    receipt=$(jq -cn --argjson before "$before" --argjson prepared "$prepared" \
+      --arg crew_id "$crew_id" --arg run_id "$run_id" --argjson baseline "$baseline" \
+      '{before: $before, prepared: $prepared, crew_id: $crew_id, run_id: $run_id,
+        baseline_last_event_seq: $baseline}') || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    tmp=$(mktemp "$CB_STATE_DIR/.crew.json.XXXXXX") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    jq --arg n "$name" --argjson prepared "$prepared" '.[$n] = $prepared' \
+      "$CB_REG" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
+  fi
+  [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
+  cb_lock_release "$CB_REG_LOCK" || status=1
+  if [ "$status" -eq 0 ]; then
+    # shellcheck disable=SC2034 # consumed by the dispatcher after this file is sourced
+    CB_REG_SEND_RECEIPT=$receipt
+  fi
+  return "$status"
+}
+
+cb_reg_send_finish() {
+  local name=$1 receipt=$2 outcome=$3 before prepared crew_id run_id baseline
+  local current current_seq replacement tmp status=0
+  case $outcome in success|failure) ;; *) return 1 ;; esac
+  receipt=$(jq -ce '
+    select(type == "object" and
+      keys == ["baseline_last_event_seq","before","crew_id","prepared","run_id"] and
+      (.before | type == "object") and (.prepared | type == "object") and
+      (.crew_id | type == "string" and length > 0) and
+      (.run_id | type == "string" and length > 0) and
+      (.baseline_last_event_seq | type == "number" and floor == . and . >= 0))
+  ' <<< "$receipt") || return 1
+  before=$(jq -c '.before' <<< "$receipt") || return 1
+  prepared=$(jq -c '.prepared' <<< "$receipt") || return 1
+  crew_id=$(jq -r '.crew_id' <<< "$receipt") || return 1
+  run_id=$(jq -r '.run_id' <<< "$receipt") || return 1
+  baseline=$(jq -r '.baseline_last_event_seq' <<< "$receipt") || return 1
+
+  cb_reg_init || return 1
+  cb_lock_acquire "$CB_REG_LOCK" || return 1
+  jq -e 'type == "object"' "$CB_REG" >/dev/null || status=1
+  if [ "$status" -eq 0 ]; then
+    current=$(jq -cer --arg n "$name" '.[$n] // empty' "$CB_REG") || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    case $outcome in
+      failure)
+        if jq -e --argjson prepared "$prepared" '. == $prepared' \
+          <<< "$current" >/dev/null; then
+          replacement=$before
+        else
+          status=2
+        fi
+        ;;
+      success)
+        if ! jq -e --arg crew_id "$crew_id" --arg run_id "$run_id" \
+          '.crew_id == $crew_id and .run_id == $run_id' \
+          <<< "$current" >/dev/null; then
+          status=2
+        else
+          current_seq=$(jq -r '
+            if ((.last_event_seq? | type) == "number" and
+                (.last_event_seq | floor) == .last_event_seq and .last_event_seq >= 0)
+            then .last_event_seq else 0 end
+          ' <<< "$current") || status=1
+          if [ "$status" -eq 0 ] && [ "$current_seq" = "$baseline" ]; then
+            replacement=$(jq -c --argjson baseline "$baseline" '
+              . + {task_status: "running", blocked: false, message: "",
+                   last_event_seq: $baseline}
+            ' <<< "$current") || status=1
+          else
+            replacement=$current
+          fi
+        fi
+        ;;
+    esac
+  fi
+  if [ "$status" -eq 0 ] && [ "$replacement" != "$current" ]; then
+    tmp=$(mktemp "$CB_STATE_DIR/.crew.json.XXXXXX") || status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -n "${tmp:-}" ]; then
+    jq --arg n "$name" --argjson replacement "$replacement" '.[$n] = $replacement' \
+      "$CB_REG" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CB_REG" || status=1
   fi
   [ -z "${tmp:-}" ] || [ ! -f "$tmp" ] || rm -f "$tmp"
   cb_lock_release "$CB_REG_LOCK" || status=1
