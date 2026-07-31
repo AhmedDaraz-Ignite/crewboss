@@ -48,6 +48,13 @@ name (`spawn "ABC-123 fix login"` creates crew `ABC-123` on branch
 overrides the prefix (default: git user.name, lowercased), `CB_BASE` overrides the
 base ref (default: the remote's default branch), `--branch` overrides everything.
 
+Normal `remove` checks for uncommitted files and commits not found on a known remote.
+It refuses cleanup if either exists. `-f` is explicit discard authority: it means the
+human accepts losing local work. A refusal leaves the registry and worktree recoverable.
+Before closing, crewboss verifies that the live pane still belongs to this crew. It also
+refuses to start a crew if its branch is checked out in the primary repo, so crews run
+in separate worktrees.
+
 ## Rules for the orchestrating agent
 
 1. **Waiting must cost zero tokens.** `wait` is one blocking shell call; issue it and
@@ -61,7 +68,9 @@ base ref (default: the remote's default branch), `--branch` overrides everything
 4. **Prefer `close` over `remove`** when the work might continue - closing costs
    nothing (the worktree keeps the files, `open` resumes the conversation), removing
    deletes the worktree.
-5. **If `wait` times out**, the crew is still going or stuck: `read` it, and if it is
+5. **Do not invent discard authority.** If normal `remove` refuses, report why. Do not
+   retry with `-f` unless the human explicitly authorized discarding local work.
+6. **If `wait` times out**, the crew is still going or stuck: `read` it, and if it is
    blocked on a question, `focus` it and tell the human, or `send` the answer.
 
 ## Typical flow
