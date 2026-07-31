@@ -118,8 +118,10 @@ do_focus() {
 do_close() {
   require_crew "$1"
   [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is already closed"
-  cb_pane_close "$(cb_reg_field "$1" pane)"
-  cb_reg_put "$1" '{"status": "closed", "token": ""}'
+  cb_pane_close "$(cb_reg_field "$1" pane)" "$1" ||
+    die "could not safely close '$1'"
+  cb_reg_put "$1" '{"status": "closed", "token": ""}' ||
+    die "could not update the crew registry"
   echo "closed $1 (worktree and conversation kept; crewboss open $1 to resume)"
 }
 
