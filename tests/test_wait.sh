@@ -22,41 +22,97 @@ setup_wait() {
   cb_event_init
 }
 
-run_wait_bounded() {
-  local label=$1 marker output errors status pid step
+start_wait_recorded() {
+  local label=$1 step
   shift
-  marker="$TEST_TMP/$label.status"
-  output="$TEST_TMP/$label.out"
-  errors="$TEST_TMP/$label.err"
+  WAIT_MARKER="$TEST_TMP/$label.status"
+  WAIT_OUTPUT_FILE="$TEST_TMP/$label.out"
+  WAIT_ERRORS_FILE="$TEST_TMP/$label.err"
+  WAIT_PID_FILE="$TEST_TMP/$label.pid"
 
   (
+    local child_pid child_status
     CB_STATE_DIR="$CB_STATE_DIR" CB_EVENT_WAIT_SECS=0.01 \
-      "$CREWBOSS" wait "$@" > "$output" 2> "$errors"
-    status=$?
-    printf '%s\n' "$status" > "$marker"
+      "$CREWBOSS" wait "$@" > "$WAIT_OUTPUT_FILE" 2> "$WAIT_ERRORS_FILE" &
+    child_pid=$!
+    printf '%s\n' "$child_pid" > "$WAIT_PID_FILE"
+    wait "$child_pid"
+    child_status=$?
+    printf '%s\n' "$child_status" > "$WAIT_MARKER"
   ) &
-  pid=$!
+  WAIT_WRAPPER_PID=$!
 
-  for step in $(seq 1 500); do
-    [ -f "$marker" ] && break
+  step=0
+  while [ "$step" -lt 500 ]; do
+    step=$((step + 1))
+    [ -f "$WAIT_PID_FILE" ] && break
     sleep 0.01
   done
-  if [ ! -f "$marker" ]; then
-    kill -9 "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+  [ -f "$WAIT_PID_FILE" ] || {
+    kill -9 "$WAIT_WRAPPER_PID" 2>/dev/null || true
+    wait "$WAIT_WRAPPER_PID" 2>/dev/null || true
+    return 1
+  }
+  WAIT_CHILD_PID=
+  IFS= read -r WAIT_CHILD_PID < "$WAIT_PID_FILE"
+}
+
+terminate_wait_recorded() {
+  local step=0
+  kill -TERM "$WAIT_CHILD_PID" 2>/dev/null || true
+  while [ "$step" -lt 100 ]; do
+    step=$((step + 1))
+    [ -f "$WAIT_MARKER" ] && break
+    sleep 0.01
+  done
+  if [ ! -f "$WAIT_MARKER" ]; then
+    kill -9 "$WAIT_CHILD_PID" 2>/dev/null || true
+  fi
+  wait "$WAIT_WRAPPER_PID" 2>/dev/null || true
+}
+
+finish_wait_bounded() {
+  local step=0
+  while [ "$step" -lt 500 ]; do
+    step=$((step + 1))
+    [ -f "$WAIT_MARKER" ] && break
+    sleep 0.01
+  done
+  if [ ! -f "$WAIT_MARKER" ]; then
+    terminate_wait_recorded
     RUN_STATUS=124
   else
-    wait "$pid" 2>/dev/null || true
+    wait "$WAIT_WRAPPER_PID" 2>/dev/null || true
     RUN_STATUS=
-    IFS= read -r RUN_STATUS < "$marker" || RUN_STATUS=1
+    IFS= read -r RUN_STATUS < "$WAIT_MARKER" || RUN_STATUS=1
   fi
-  RUN_OUTPUT=$(cat "$output" 2>/dev/null || true)
-  RUN_ERRORS=$(cat "$errors" 2>/dev/null || true)
+  RUN_OUTPUT=$(cat "$WAIT_OUTPUT_FILE" 2>/dev/null || true)
+  RUN_ERRORS=$(cat "$WAIT_ERRORS_FILE" 2>/dev/null || true)
+}
+
+run_wait_bounded() {
+  start_wait_recorded "$@" || return 1
+  finish_wait_bounded
 }
 
 write_event_source() {
   cb_event_init || return 1
   printf '%s\n' "$@" > "$CB_EVENT_SOURCE"
+}
+
+assert_corrupt_checkpoint_fails_unchanged() {
+  local checkpoint=$1
+  write_event_source \
+    '{"version":1,"seq":1,"event_id":"event-1","crew":"A","crew_id":"crew-a","run_id":"run-a","kind":"done","payload":"must not apply","time":"2026-07-31T12:00:01Z"}' || return 1
+  printf '%s\n' "$checkpoint" > "$CB_EVENT_STATE"
+  cp "$CB_EVENT_SOURCE" "$TEST_TMP/events.before" || return 1
+  cp "$CB_EVENT_STATE" "$TEST_TMP/event-state.before" || return 1
+  cp "$CB_REG" "$TEST_TMP/crew.before" || return 1
+
+  ! cb_event_pump >/dev/null 2>&1 || return 1
+  cmp -s "$TEST_TMP/events.before" "$CB_EVENT_SOURCE" || return 1
+  cmp -s "$TEST_TMP/event-state.before" "$CB_EVENT_STATE" || return 1
+  cmp -s "$TEST_TMP/crew.before" "$CB_REG"
 }
 
 test_wait_routes_global_fifo_and_keeps_unselected_events_across_restarts() {
@@ -155,6 +211,18 @@ test_sequence_gap_stops_without_advancing() {
   assert_eq 0 "$(cb_reg_field A last_event_seq)"
 }
 
+test_checkpoint_rejects_multiple_json_documents_without_changes() {
+  setup_wait || return 1
+  assert_corrupt_checkpoint_fails_unchanged \
+    $'{"cursor":0,"pending":{}}\n{"cursor":0,"pending":{}}'
+}
+
+test_checkpoint_rejects_pending_ahead_of_cursor_without_changes() {
+  setup_wait || return 1
+  assert_corrupt_checkpoint_fails_unchanged \
+    '{"cursor":0,"pending":{"crew-a":{"version":1,"seq":1,"event_id":"event-1","crew":"A","crew_id":"crew-a","run_id":"run-a","kind":"done","payload":"must not apply","time":"2026-07-31T12:00:01Z"}}}'
+}
+
 test_incomplete_final_line_waits_for_its_newline() {
   setup_wait || return 1
   cb_event_init || return 1
@@ -243,43 +311,21 @@ test_wait_prunes_a_stale_pending_run_before_listening() {
   cb_event_pump || return 1
   cb_reg_put A '{"run_id":"run-new","task_status":"running","last_event_seq":0}' || return 1
 
-  local marker="$TEST_TMP/prune.status" output="$TEST_TMP/prune.out" errors="$TEST_TMP/prune.err"
-  local pid step status
-  (
-    CB_STATE_DIR="$CB_STATE_DIR" CB_EVENT_WAIT_SECS=0.01 \
-      "$CREWBOSS" wait A > "$output" 2> "$errors"
-    status=$?
-    printf '%s\n' "$status" > "$marker"
-  ) &
-  pid=$!
+  start_wait_recorded prune A || return 1
 
   sleep 0.1
-  if [ -f "$marker" ]; then
-    wait "$pid" 2>/dev/null || true
+  if [ -f "$WAIT_MARKER" ]; then
+    wait "$WAIT_WRAPPER_PID" 2>/dev/null || true
     return 1
   fi
   CB_STATE_DIR="$CB_STATE_DIR" "$CREWBOSS" emit \
     A crew-a run-new "done" "new result" >/dev/null 2>&1 || {
-    kill -9 "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    terminate_wait_recorded
     return 1
   }
-  step=0
-  while [ "$step" -lt 500 ]; do
-    step=$((step + 1))
-    [ -f "$marker" ] && break
-    sleep 0.01
-  done
-  if [ ! -f "$marker" ]; then
-    kill -9 "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    return 1
-  fi
-  wait "$pid" 2>/dev/null || true
-  status=
-  IFS= read -r status < "$marker" || return 1
-  assert_eq 0 "$status" || return 1
-  assert_eq $'A done\nnew result' "$(cat "$output")"
+  finish_wait_bounded
+  assert_eq 0 "$RUN_STATUS" || return 1
+  assert_eq $'A done\nnew result' "$RUN_OUTPUT"
 }
 
 run_test "wait routes global FIFO and keeps other crews across restarts" \
@@ -296,6 +342,10 @@ run_test "a complete blank line does not advance the cursor" \
   test_complete_blank_line_stops_without_advancing
 run_test "a sequence gap does not advance the cursor" \
   test_sequence_gap_stops_without_advancing
+run_test "a multi-document checkpoint changes no durable state" \
+  test_checkpoint_rejects_multiple_json_documents_without_changes
+run_test "a pending event ahead of the cursor changes no durable state" \
+  test_checkpoint_rejects_pending_ahead_of_cursor_without_changes
 run_test "an incomplete final line waits for a newline" \
   test_incomplete_final_line_waits_for_its_newline
 run_test "a registry failure does not advance the cursor" \

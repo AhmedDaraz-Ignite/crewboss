@@ -52,7 +52,7 @@ _cb_event_parse_last_seq() {
 }
 
 _cb_event_state_valid() {
-  jq -e --argjson max "$CB_EVENT_MAX_SEQ" '
+  jq -e -s --argjson max "$CB_EVENT_MAX_SEQ" '
     def event:
       type == "object" and
       keys == ["crew","crew_id","event_id","kind","payload","run_id","seq","time","version"] and
@@ -65,11 +65,16 @@ _cb_event_state_valid() {
       (.kind == "blocked" or .kind == "done") and
       (.payload | type == "string" and length > 0) and
       (.time | type == "string" and length > 0);
-    type == "object" and
-    keys == ["cursor","pending"] and
-    (.cursor | type == "number" and floor == . and . >= 0 and . <= $max) and
-    (.pending | type == "object") and
-    all(.pending | to_entries[]; .key == .value.crew_id and (.value | event))
+    length == 1 and
+    (.[0] |
+      . as $state |
+      type == "object" and
+      keys == ["cursor","pending"] and
+      (.cursor | type == "number" and floor == . and . >= 0 and . <= $max) and
+      (.pending | type == "object") and
+      all(.pending | to_entries[];
+        .key == .value.crew_id and (.value | event) and
+        .value.seq <= $state.cursor))
   ' >/dev/null
 }
 
