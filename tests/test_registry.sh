@@ -645,6 +645,21 @@ test_stale_endpoint_reconcile_cannot_overwrite_a_reopened_pane() {
   assert_eq "$before" "$after"
 }
 
+test_stale_endpoint_reconcile_cannot_close_a_replacement_crew_lifetime() {
+  setup_registry
+  cb_reg_put crew '{"crew_id":"crew-old","pane":"w1:p1","status":"open","endpoint_state":"open"}' || return 1
+  cb_reg_replace crew '{"crew_id":"crew-new","pane":"w1:p1","status":"open","endpoint_state":"open","kept":"replacement"}' || return 1
+  local before status after
+  before=$(jq -c '.crew' "$CB_REG") || return 1
+
+  cb_reg_reconcile_endpoint crew w1:p1 closed crew-old >/dev/null 2>&1
+  status=$?
+  after=$(jq -c '.crew' "$CB_REG") || return 1
+
+  assert_eq 2 "$status" || return 1
+  assert_eq "$before" "$after"
+}
+
 test_endpoint_reconcile_requires_an_open_lifecycle() {
   setup_registry
   cb_reg_put crew '{"pane":"w1:p1","status":"closed","endpoint_state":"closed"}' || return 1
@@ -729,6 +744,8 @@ run_test "endpoint reconciliation atomically closes a matching open lifecycle" \
   test_endpoint_reconcile_closes_the_matching_open_lifecycle_atomically
 run_test "a stale endpoint probe cannot overwrite a reopened pane" \
   test_stale_endpoint_reconcile_cannot_overwrite_a_reopened_pane
+run_test "a stale endpoint probe cannot close a replacement crew lifetime" \
+  test_stale_endpoint_reconcile_cannot_close_a_replacement_crew_lifetime
 run_test "endpoint reconciliation requires an open lifecycle" \
   test_endpoint_reconcile_requires_an_open_lifecycle
 run_test "new registry identities use unique requested prefixes" test_new_ids_keep_the_requested_prefix_and_are_unique

@@ -88,7 +88,7 @@ do_spawn() {
        blocked: false, message: "", last_event_seq: 0}
     ')" || die "could not save crew state"
   if ! cb_agent_prompt "$name" "$task" "$crew_id" "$run_id" \
-    "$CB_HOME/crewboss" "$CB_STATE_DIR"; then
+    "$CB_HOME/crewboss" "$CB_STATE_DIR" "$pane"; then
     cb_reg_mark_prompt_unknown "$name" "$crew_id" "$run_id" 0
     failure_status=$?
     case $failure_status in
@@ -104,18 +104,22 @@ do_spawn() {
 do_list() {
   cb_reg_init
   cb_event_pump || die "could not read crew events"
-  local n record lifecycle pane endpoint reconcile_status
+  local n record lifecycle pane crew_id endpoint reconcile_status
   for n in $(cb_reg_names); do
     record=$(cb_reg_get "$n") || die "could not read crew '$n'"
     lifecycle=$(jq -r '.status // empty' <<< "$record") || die "could not read crew '$n'"
     [ "$lifecycle" = open ] || continue
     pane=$(jq -r '.pane // empty' <<< "$record") || die "could not read crew '$n'"
+    crew_id=$(jq -r '
+      if ((.crew_id? | type) == "string" and (.crew_id | length) > 0)
+      then .crew_id else "" end
+    ' <<< "$record") || die "could not read crew '$n'"
     if [ -n "$pane" ]; then
       endpoint=$(cb_pane_status "$pane" "$n") || die "could not inspect crew '$n'"
     else
       endpoint=unknown
     fi
-    cb_reg_reconcile_endpoint "$n" "$pane" "$endpoint"
+    cb_reg_reconcile_endpoint "$n" "$pane" "$endpoint" "$crew_id"
     reconcile_status=$?
     case $reconcile_status in
       0|2) ;;
@@ -159,25 +163,28 @@ do_send() {
   require_crew "$name"
   [ "$(cb_reg_field "$name" status)" = open ] || die "'$name' is closed (crewboss open $name)"
   [ $# -gt 0 ] || die "send needs text"
-  local prompt=$* candidate_crew_id crew_id run_id receipt finish_status
+  local prompt=$* candidate_crew_id crew_id run_id receipt pane finish_status
   candidate_crew_id=$(cb_id_new crew) || die "could not create crew identity"
   run_id=$(cb_id_new run) || die "could not create run identity"
   cb_reg_send_begin "$name" "$candidate_crew_id" "$run_id" "$prompt" ||
     die "could not prepare the crew state"
   receipt=$CB_REG_SEND_RECEIPT
   crew_id=$(jq -r '.crew_id' <<< "$receipt") || die "could not read the crew identity"
+  pane=$(jq -r '
+    if ((.prepared.pane? | type) == "string") then .prepared.pane else "" end
+  ' <<< "$receipt") || pane=
 
   if cb_agent_prompt "$name" "$prompt" "$crew_id" "$run_id" \
-    "$CB_HOME/crewboss" "$CB_STATE_DIR"; then
+    "$CB_HOME/crewboss" "$CB_STATE_DIR" "$pane"; then
     cb_reg_send_finish "$name" "$receipt" success ||
       die "task was sent but the crew state changed before delivery finished"
   else
     cb_reg_send_finish "$name" "$receipt" failure
     finish_status=$?
     case $finish_status in
-      0) die "could not send" ;;
-      2) die "could not send; crew state changed while delivery was in progress" ;;
-      *) die "could not send and could not restore the previous crew state" ;;
+      0) die "could not confirm prompt delivery" ;;
+      2) die "could not confirm prompt delivery; crew state changed while delivery was in progress" ;;
+      *) die "could not confirm prompt delivery and could not update crew state" ;;
     esac
   fi
   echo "sent; crewboss wait $name"

@@ -25,6 +25,12 @@ sleep() {
 
 herdr() {
   local attempts=0
+  if [ "$1 $2" = "pane wait-output" ]; then
+    printf '%s\n' "$*" >> "$HERDR_LOG"
+    IFS= read -r attempts < "$PROMPT_ATTEMPTS" || attempts=0
+    [ "$attempts" -ge "$PROMPT_VISIBLE_AFTER" ]
+    return
+  fi
   if [ "$1" != agent ]; then
     return 2
   fi
@@ -53,7 +59,13 @@ herdr() {
       if [ "$attempts" -ge "$PROMPT_VISIBLE_AFTER" ]; then
         case $PROMPT_READ_MODE in
           marker) sed -n '/^CrewBoss run id: /p' "$PROMPT_TEXT" ;;
-          tail) tail -n 1 "$PROMPT_TEXT" ;;
+          displaced)
+            local line=0
+            while [ "$line" -lt 121 ]; do
+              line=$((line + 1))
+              printf 'newer output %s\n' "$line"
+            done
+            ;;
           *) return 2 ;;
         esac
       else
@@ -189,18 +201,19 @@ test_prompt_send_uses_internal_target() {
   reset_agent_fake prompt
 
   cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
-    /tmp/crewboss /tmp/state >/dev/null || return 1
+    /tmp/crewboss /tmp/state w1:p1 >/dev/null || return 1
 
   assert_contains "$(cat "$HERDR_LOG")" "prompt smoke-100"
 }
 
-test_prompt_confirmation_read_uses_internal_target() {
-  reset_agent_fake read
+test_prompt_confirmation_waits_on_the_registered_pane() {
+  reset_agent_fake prompt
 
   cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
-    /tmp/crewboss /tmp/state >/dev/null || return 1
+    /tmp/crewboss /tmp/state w1:p7 >/dev/null || return 1
 
-  assert_contains "$(cat "$HERDR_LOG")" "read smoke-100"
+  assert_contains "$(cat "$HERDR_LOG")" \
+    "pane wait-output w1:p7 --match CrewBoss run id: run-456 --source recent-unwrapped --timeout 4000"
 }
 
 test_prompt_teaches_the_shell_safe_event_protocol() {
@@ -208,7 +221,7 @@ test_prompt_teaches_the_shell_safe_event_protocol() {
   local output prompt
 
   output=$(cb_agent_prompt SMOKE-100 "do the exact task" crew-123 run-456 \
-    "/tmp/CrewBoss tool's/bin/crewboss" "/tmp/state dir's") || return 1
+    "/tmp/CrewBoss tool's/bin/crewboss" "/tmp/state dir's" w1:p1) || return 1
   prompt=$(cat "$PROMPT_TEXT")
 
   assert_eq '' "$output" || return 1
@@ -260,7 +273,7 @@ TOOL
   chmod +x "$tool"
 
   cb_agent_prompt "$name" "do the exact task" "$crew_id" "$run_id" \
-    "$tool" "$state" >/dev/null || return 1
+    "$tool" "$state" w1:p1 >/dev/null || return 1
   prompt=$(cat "$PROMPT_TEXT")
   blocked_example=$(extract_prompt_example "$prompt" blocked) || return 1
   done_example=$(extract_prompt_example "$prompt" "done") || return 1
@@ -309,7 +322,7 @@ TOOL
   chmod +x "$tool"
 
   cb_agent_prompt SMOKE-100 "do the exact task" crew-123 run-456 \
-    "$tool" "$fixture/state" >/dev/null || return 1
+    "$tool" "$fixture/state" w1:p1 >/dev/null || return 1
   prompt=$(cat "$PROMPT_TEXT")
   example=$(extract_prompt_example "$prompt" blocked) || return 1
   zero='zero trailing newlines'
@@ -336,19 +349,20 @@ test_prompt_delivery_retries_until_the_fifth_attempt() {
   PROMPT_VISIBLE_AFTER=5
 
   cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
-    /tmp/crewboss /tmp/state >/dev/null || return 1
+    /tmp/crewboss /tmp/state w1:p1 >/dev/null || return 1
 
   assert_eq 5 "$(cat "$PROMPT_ATTEMPTS")"
 }
 
-test_prompt_delivery_is_confirmed_from_the_prompt_tail() {
+test_prompt_delivery_survives_more_than_120_newer_lines() {
   reset_agent_fake prompt
-  PROMPT_READ_MODE='tail'
+  PROMPT_READ_MODE=displaced
 
   cb_agent_prompt SMOKE-100 "do the task" crew-123 run-456 \
-    /tmp/crewboss /tmp/state >/dev/null || return 1
+    /tmp/crewboss /tmp/state w1:p1 >/dev/null || return 1
 
-  assert_eq 1 "$(cat "$PROMPT_ATTEMPTS")"
+  assert_eq 1 "$(cat "$PROMPT_ATTEMPTS")" || return 1
+  assert_contains "$(cat "$HERDR_LOG")" "pane wait-output w1:p1"
 }
 
 test_general_read_uses_internal_target() {
@@ -418,14 +432,15 @@ run_test "keeps hash targets stable across repository object formats" test_hash_
 run_test "starts an agent with the internal target" test_start_uses_internal_target
 run_test "retries a busy pane through the fifteenth start attempt" test_start_retries_busy_pane_through_the_fifteenth_attempt
 run_test "prompts an agent with the internal target" test_prompt_send_uses_internal_target
-run_test "confirms a prompt with the internal target" test_prompt_confirmation_read_uses_internal_target
+run_test "confirms a prompt on the registered pane" \
+  test_prompt_confirmation_waits_on_the_registered_pane
 run_test "teaches crews the shell-safe event protocol" test_prompt_teaches_the_shell_safe_event_protocol
 run_test "keeps hostile values inert in executable event examples" test_prompt_event_examples_execute_with_hostile_values
 run_test "preserves zero one and multiple trailing payload newlines" \
   test_prompt_event_examples_preserve_trailing_newlines
 run_test "retries prompt delivery through the fifth attempt" test_prompt_delivery_retries_until_the_fifth_attempt
-run_test "confirms delivered prompts from the pane tail on the first attempt" \
-  test_prompt_delivery_is_confirmed_from_the_prompt_tail
+run_test "confirms delivery after more than 120 newer output lines" \
+  test_prompt_delivery_survives_more_than_120_newer_lines
 run_test "reads an agent with the internal target" test_general_read_uses_internal_target
 run_test "explains an agent with the internal target" test_state_uses_internal_target
 run_test "focuses the internal target through the public registry key" test_focus_uses_internal_target_and_public_registry_key

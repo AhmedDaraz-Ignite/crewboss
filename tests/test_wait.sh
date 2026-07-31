@@ -210,6 +210,7 @@ case "$1 $2" in
   "agent read")
     sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT"
     ;;
+  "pane wait-output") ;;
   *) exit 2 ;;
 esac
 HERDR
@@ -297,6 +298,7 @@ case "$1 $2" in
   "agent read")
     sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT"
     ;;
+  "pane wait-output") ;;
   *) exit 2 ;;
 esac
 HERDR
@@ -371,6 +373,9 @@ case "$1 $2" in
     ;;
   "agent read")
     printf 'prompt confirmation unavailable\n'
+    ;;
+  "pane wait-output")
+    exit 1
     ;;
   *) exit 2 ;;
 esac
@@ -454,10 +459,18 @@ case "$1 $2" in
       (.[$name].run_id | type == "string" and startswith("run-") and . != $old_run)
     ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 70
     if [ "$TEST_RECORD_MODE" = phase1 ]; then
-      jq -e --arg name "$TEST_CREW" '
-        .[$name].crew_id == "crew-a" and .[$name].task_status == "blocked" and
-        .[$name].blocked == true and .[$name].message == "old question"
-      ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 71
+      if [ "$TEST_PROMPT_MODE" = fail_applied ] && [ -e "$TEST_EVENT_SENT" ]; then
+        jq -e --arg name "$TEST_CREW" '
+          .[$name].crew_id == "crew-a" and .[$name].task_status == "done" and
+          .[$name].blocked == false and
+          .[$name].message == "event despite failed confirmation"
+        ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 71
+      else
+        jq -e --arg name "$TEST_CREW" '
+          .[$name].crew_id == "crew-a" and .[$name].task_status == "blocked" and
+          .[$name].blocked == true and .[$name].message == "old question"
+        ' "$CB_STATE_DIR/crew.json" >/dev/null || exit 71
+      fi
     else
       jq -e --arg name "$TEST_CREW" '
         (.[$name] | has("task_status") | not) and (.[$name] | has("task") | not)
@@ -470,13 +483,33 @@ case "$1 $2" in
       "$TEST_WAIT_BOUNDED" "$TEST_IMMEDIATE_OUTPUT" \
         "$CREWBOSS" wait "$TEST_CREW" || exit 76
     fi
+    case $TEST_PROMPT_MODE in
+      fail_raw|fail_applied)
+        if [ ! -e "$TEST_EVENT_SENT" ]; then
+          crew_id=$(jq -r --arg name "$TEST_CREW" '.[$name].crew_id' "$CB_STATE_DIR/crew.json") || exit 77
+          run_id=$(jq -r --arg name "$TEST_CREW" '.[$name].run_id' "$CB_STATE_DIR/crew.json") || exit 78
+          "$CREWBOSS" emit "$TEST_CREW" "$crew_id" "$run_id" done \
+            "event despite failed confirmation" || exit 79
+          if [ "$TEST_PROMPT_MODE" = fail_applied ]; then
+            "$TEST_WAIT_BOUNDED" "$TEST_IMMEDIATE_OUTPUT" \
+              "$CREWBOSS" wait "$TEST_CREW" || exit 80
+          fi
+          : > "$TEST_EVENT_SENT"
+        fi
+        ;;
+    esac
     ;;
   "agent read")
-    if [ "$TEST_PROMPT_MODE" != fail ]; then
-      sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT_FILE"
-    else
-      printf 'prompt still not visible\n'
-    fi
+    case $TEST_PROMPT_MODE in
+      fail|fail_raw|fail_applied) printf 'prompt still not visible\n' ;;
+      *) sed -n '/^CrewBoss run id: /p' "$TEST_PROMPT_FILE" ;;
+    esac
+    ;;
+  "pane wait-output")
+    case $TEST_PROMPT_MODE in
+      fail|fail_raw|fail_applied) exit 1 ;;
+      *) exit 0 ;;
+    esac
     ;;
   *) exit 2 ;;
 esac
@@ -507,6 +540,7 @@ run_send_cli() {
   PATH="$SEND_BIN:$PATH" CB_STATE_DIR="$SEND_STATE" CREWBOSS="$CREWBOSS" \
     TEST_HERDR_LOG="$SEND_TMP/herdr.log" TEST_PROMPT_FILE="$SEND_TMP/prompt" \
     TEST_IMMEDIATE_OUTPUT="$SEND_TMP/immediate.out" TEST_CREW=A \
+    TEST_EVENT_SENT="$SEND_TMP/event-sent" \
     TEST_NEW_PROMPT="follow-up answer" TEST_OLD_RUN="${TEST_OLD_RUN:-run-old}" \
     TEST_RECORD_MODE="$TEST_RECORD_MODE" TEST_PROMPT_MODE="$TEST_PROMPT_MODE" \
     TEST_WAIT_BOUNDED="$SEND_BIN/wait-bounded" \
@@ -534,12 +568,11 @@ test_send_persists_new_run_before_prompt_without_clobbering_an_immediate_event()
   ' "$SEND_STATE/crew.json" >/dev/null
 }
 
-test_failed_send_restores_the_complete_previous_record() {
+test_failed_send_keeps_the_new_run_and_marks_task_unknown() {
   setup_send_cli
   trap 'rm -rf "$SEND_TMP"' RETURN
   write_phase1_send_record
-  local before output status
-  before=$(jq -c '.A' "$SEND_STATE/crew.json") || return 1
+  local output status
   TEST_RECORD_MODE=phase1
   TEST_PROMPT_MODE=fail
 
@@ -547,9 +580,60 @@ test_failed_send_restores_the_complete_previous_record() {
   status=$?
 
   [ "$status" -ne 0 ] || return 1
-  assert_contains "$output" "could not send" || return 1
   assert_eq 5 "$(grep -c '^prompt$' "$SEND_TMP/herdr.log")" || return 1
-  jq -e --argjson before "$before" '.A == $before' "$SEND_STATE/crew.json" >/dev/null
+  assert_eq unknown "$(jq -r '.A.task_status' "$SEND_STATE/crew.json")" || return 1
+  jq -e '.A.crew_id == "crew-a" and .A.run_id != "run-old" and
+    .A.task == "initial task" and .A.latest_prompt == "follow-up answer" and
+    .A.task_status == "unknown" and .A.blocked == false and .A.message == "" and
+    .A.last_event_seq == 0' "$SEND_STATE/crew.json" >/dev/null || return 1
+  assert_contains "$output" "could not confirm prompt delivery"
+}
+
+test_failed_send_keeps_a_raw_new_run_event_current_and_wakeable() {
+  setup_send_cli
+  trap 'rm -rf "$SEND_TMP"' RETURN
+  write_phase1_send_record
+  TEST_RECORD_MODE=phase1
+  TEST_PROMPT_MODE=fail_raw
+  local output status
+
+  output=$(run_send_cli 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || return 1
+  assert_eq unknown "$(jq -r '.A.task_status' "$SEND_STATE/crew.json")" || return 1
+  jq -e '.A.run_id != "run-old" and .A.latest_prompt == "follow-up answer"' \
+    "$SEND_STATE/crew.json" >/dev/null || return 1
+  assert_contains "$output" "could not confirm prompt delivery" || return 1
+
+  CB_STATE_DIR="$SEND_STATE" "$SEND_BIN/wait-bounded" "$SEND_TMP/raw.out" \
+    "$CREWBOSS" wait A || return 1
+  assert_eq $'A done\nevent despite failed confirmation' \
+    "$(cat "$SEND_TMP/raw.out")" || return 1
+  jq -e '.A.run_id != "run-old" and .A.task_status == "done" and
+    .A.message == "event despite failed confirmation" and .A.last_event_seq == 1' \
+    "$SEND_STATE/crew.json" >/dev/null
+}
+
+test_failed_send_preserves_an_applied_new_run_event_projection() {
+  setup_send_cli
+  trap 'rm -rf "$SEND_TMP"' RETURN
+  write_phase1_send_record
+  TEST_RECORD_MODE=phase1
+  TEST_PROMPT_MODE=fail_applied
+  local output status
+
+  output=$(run_send_cli 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] || return 1
+  assert_contains "$output" "could not confirm prompt delivery" || return 1
+  assert_eq 5 "$(grep -c '^prompt$' "$SEND_TMP/herdr.log")" || return 1
+  assert_eq $'A done\nevent despite failed confirmation' \
+    "$(cat "$SEND_TMP/immediate.out")" || return 1
+  jq -e '.A.run_id != "run-old" and .A.latest_prompt == "follow-up answer" and
+    .A.task_status == "done" and .A.blocked == false and
+    .A.message == "event despite failed confirmation" and .A.last_event_seq == 1' \
+    "$SEND_STATE/crew.json" >/dev/null
 }
 
 test_send_upgrades_a_legacy_record_without_losing_old_fields() {
@@ -895,8 +979,12 @@ run_test "failed initial prompt preserves an applied event" \
   test_failed_initial_prompt_preserves_an_applied_event
 run_test "send persists a new run and keeps an immediate event" \
   test_send_persists_new_run_before_prompt_without_clobbering_an_immediate_event
-run_test "a failed send restores the complete previous record" \
-  test_failed_send_restores_the_complete_previous_record
+run_test "a failed send keeps the new run and marks task truth unknown" \
+  test_failed_send_keeps_the_new_run_and_marks_task_unknown
+run_test "a failed send keeps a raw new-run event current and wakeable" \
+  test_failed_send_keeps_a_raw_new_run_event_current_and_wakeable
+run_test "a failed send preserves an applied new-run event projection" \
+  test_failed_send_preserves_an_applied_new_run_event_projection
 run_test "send upgrades a legacy record without losing old fields" \
   test_send_upgrades_a_legacy_record_without_losing_old_fields
 run_test "wait skips old crew and old run events" \

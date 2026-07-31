@@ -55,21 +55,27 @@ cb_pane_status() {
 }
 
 cb_pane_close() {
-  local pane=$1 name=$2 response status live target
+  local pane=$1 name=$2 response status live code target
   target=$(cb_agent_target "$name") || return 1
   response=$(herdr agent get "$target" 2>&1)
   status=$?
 
   if [ "$status" -ne 0 ]; then
-    if printf '%s' "$response" |
-        jq -e '.error.code == "agent_not_found"' >/dev/null 2>&1; then
+    code=$(printf '%s' "$response" | jq -ers '
+      select(length == 1) | .[0].error.code |
+      select(type == "string" and length > 0)
+    ') || code=
+    if [ "$code" = agent_not_found ]; then
       return 0
     fi
     printf '%s\n' "$response" >&2
     return 1
   fi
 
-  live=$(printf '%s' "$response" | jq -er '.result.agent.pane_id') || {
+  live=$(printf '%s' "$response" | jq -ers '
+    select(length == 1) | .[0].result.agent.pane_id |
+    select(type == "string" and length > 0)
+  ') || {
     echo "crewboss: could not verify the pane for '$name'" >&2
     return 1
   }

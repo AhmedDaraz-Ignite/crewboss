@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # agent: start, prompt, and read. All timeouts are internal - the interface never asks for one.
 CB_START_TIMEOUT_MS=120000   # startup readiness budget passed to herdr agent start
+CB_PROMPT_CONFIRM_TIMEOUT_MS=4000  # each prompt receipt budget passed to pane wait-output
 
 # Per-agent extra args. resume must restore the previous conversation in the same worktree.
 cb_agent_args() {
@@ -37,7 +38,7 @@ _cb_agent_shell_quote() {
 
 cb_agent_prompt() {
   local name=$1 task=$2 crew_id=$3 run_id=$4 tool_path=$5 state_dir=$6
-  local target tries=0 marker prompt q_name q_crew_id q_run_id q_tool q_state
+  local pane=$7 target tries=0 marker prompt q_name q_crew_id q_run_id q_tool q_state
   local payload_nonce payload_suffix blocked_delimiter done_delimiter
   target=$(cb_agent_target "$name") || return 1
   marker="CrewBoss run id: $run_id"
@@ -45,6 +46,7 @@ cb_agent_prompt() {
   payload_suffix="CREWBOSS_PAYLOAD_SUFFIX_$payload_nonce"
   blocked_delimiter="CREWBOSS_BLOCKED_PAYLOAD_$payload_nonce"
   done_delimiter="CREWBOSS_DONE_PAYLOAD_$payload_nonce"
+  [ -n "$pane" ] || return 1
   q_name=$(_cb_agent_shell_quote "$name") || return 1
   q_crew_id=$(_cb_agent_shell_quote "$crew_id") || return 1
   q_run_id=$(_cb_agent_shell_quote "$run_id") || return 1
@@ -80,16 +82,15 @@ $marker"
 
   while :; do
     herdr agent prompt "$target" "$prompt" >/dev/null || return 1
-    sleep 2
-    if herdr agent read "$target" --source recent-unwrapped --lines 120 2>/dev/null \
-        | grep -Fq -- "$marker"; then
+    if herdr pane wait-output "$pane" --match "$marker" \
+        --source recent-unwrapped --timeout "$CB_PROMPT_CONFIRM_TIMEOUT_MS" \
+        >/dev/null 2>&1; then
       return 0
     fi
     if [ $((tries += 1)) -ge 5 ]; then
       echo "crewboss: prompt never appeared in $name's pane" >&2
       return 1
     fi
-    sleep 2
   done
 }
 

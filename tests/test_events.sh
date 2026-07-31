@@ -25,6 +25,10 @@ write_event_tail_fixture() {
     "$raw_seq" "$event_id" > "$CB_EVENT_SOURCE"
 }
 
+event_source_inode() {
+  ls -di "$CB_EVENT_SOURCE" | awk '{print $1}'
+}
+
 run_emit_with_owner_snapshot() {
   local status_file="$TEST_TMP/emit.status" owner_file="$TEST_TMP/emit.owner"
   CB_STATE_DIR="$CB_STATE_DIR" bash -c '
@@ -190,6 +194,40 @@ test_emit_refuses_to_append_after_a_malformed_last_record() {
   assert_eq 2 "$(wc -l < "$CB_STATE_DIR/events.jsonl" | tr -d ' ')"
 }
 
+test_emit_refuses_an_unterminated_tail_without_changing_source() {
+  setup_events || return 1
+  cb_event_init || return 1
+  printf '%s' \
+    '{"version":1,"seq":1,"event_id":"event-1","crew":"alpha","crew_id":"crew-current","run_id":"run-current","kind":"done","payload":"unterminated","time":"2026-07-31T12:00:00Z"}' \
+    > "$CB_EVENT_SOURCE" || return 1
+  cp "$CB_EVENT_SOURCE" "$TEST_TMP/events.before" || return 1
+  local before_inode after_inode
+  before_inode=$(event_source_inode) || return 1
+
+  ! CB_STATE_DIR="$CB_STATE_DIR" "$CREWBOSS" emit \
+    alpha crew-current run-current done refused >/dev/null 2>&1 || return 1
+
+  after_inode=$(event_source_inode) || return 1
+  assert_eq "$before_inode" "$after_inode" || return 1
+  cmp -s "$TEST_TMP/events.before" "$CB_EVENT_SOURCE"
+}
+
+test_emit_appends_after_a_complete_tail_without_replacing_source() {
+  setup_events || return 1
+  write_event_tail_fixture 1 event-1 || return 1
+  local before_inode after_inode
+  before_inode=$(event_source_inode) || return 1
+
+  CB_STATE_DIR="$CB_STATE_DIR" "$CREWBOSS" emit \
+    alpha crew-current run-current done accepted >/dev/null 2>&1 || return 1
+
+  after_inode=$(event_source_inode) || return 1
+  assert_eq "$before_inode" "$after_inode" || return 1
+  jq -s -e 'length == 2 and .[0].payload == "fixture" and
+    .[1].seq == 2 and .[1].payload == "accepted"' \
+    "$CB_EVENT_SOURCE" >/dev/null
+}
+
 test_noncanonical_sequence_tokens_are_rejected_and_unlock() {
   (assert_tail_rejected_and_unlocked 1.5 event-1.5) || return 1
   (assert_tail_rejected_and_unlocked 1e3 event-1E+3) || return 1
@@ -233,6 +271,10 @@ run_test "emit rejects unknown stale and invalid producers before append" \
   test_emit_rejects_invalid_producers_before_append
 run_test "emit refuses to append after a malformed last event" \
   test_emit_refuses_to_append_after_a_malformed_last_record
+run_test "emit refuses an unterminated tail without changing bytes or inode" \
+  test_emit_refuses_an_unterminated_tail_without_changing_source
+run_test "emit appends after a complete tail without replacing the source" \
+  test_emit_appends_after_a_complete_tail_without_replacing_source
 run_test "noncanonical sequence tokens are rejected without keeping the lock" \
   test_noncanonical_sequence_tokens_are_rejected_and_unlock
 run_test "maximum and larger sequences are rejected without keeping the lock" \

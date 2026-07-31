@@ -335,7 +335,7 @@ cb_reg_send_begin() {
 }
 
 cb_reg_send_finish() {
-  local name=$1 receipt=$2 outcome=$3 before prepared crew_id run_id baseline
+  local name=$1 receipt=$2 outcome=$3 prepared crew_id run_id baseline
   local current replacement tmp status=0
   case $outcome in success|failure) ;; *) return 1 ;; esac
   receipt=$(jq -cse --arg expected_name "$name" '
@@ -373,7 +373,6 @@ cb_reg_send_finish() {
     --argjson issued "$CB_REG_SEND_ISSUED_RECEIPT" \
     '$received == $issued' >/dev/null || return 1
   CB_REG_SEND_ISSUED_RECEIPT=
-  before=$(jq -c '.before' <<< "$receipt") || return 1
   prepared=$(jq -c '.prepared' <<< "$receipt") || return 1
   crew_id=$(jq -r '.crew_id' <<< "$receipt") || return 1
   run_id=$(jq -r '.run_id' <<< "$receipt") || return 1
@@ -388,9 +387,32 @@ cb_reg_send_finish() {
   if [ "$status" -eq 0 ]; then
     case $outcome in
       failure)
-        if jq -e --argjson prepared "$prepared" '. == $prepared' \
+        if ! jq -e --arg crew_id "$crew_id" --arg run_id "$run_id" \
+          '.crew_id == $crew_id and .run_id == $run_id' \
           <<< "$current" >/dev/null; then
-          replacement=$before
+          status=2
+        elif jq -e --argjson prepared "$prepared" '. == $prepared' \
+          <<< "$current" >/dev/null; then
+          replacement=$(jq -c --argjson baseline "$baseline" '
+            . + {task_status: "unknown", blocked: false, message: "",
+                 last_event_seq: $baseline}
+          ' <<< "$current") || status=1
+        elif jq -e --argjson baseline "$baseline" --argjson prepared "$prepared" '
+          . as $current |
+          ($current.last_event_seq | type) == "number" and
+          ($current.last_event_seq | floor) == $current.last_event_seq and
+          $current.last_event_seq > $baseline and
+          ($current.task_status == "blocked" or $current.task_status == "done") and
+          ($current.blocked == ($current.task_status == "blocked")) and
+          ($current.message | type) == "string" and
+          $current == ($prepared + {
+            task_status: $current.task_status,
+            blocked: $current.blocked,
+            message: $current.message,
+            last_event_seq: $current.last_event_seq
+          })
+        ' <<< "$current" >/dev/null; then
+          replacement=$current
         else
           status=2
         fi
@@ -580,7 +602,8 @@ cb_reg_set_endpoint() {
 }
 
 cb_reg_reconcile_endpoint() {
-  local name=$1 expected_pane=$2 endpoint_state=$3 current replacement tmp status=0
+  local name=$1 expected_pane=$2 endpoint_state=$3 expected_crew_id=${4:-}
+  local current replacement tmp status=0
   case $endpoint_state in
     open|closed|unknown) ;;
     *) return 1 ;;
@@ -593,8 +616,13 @@ cb_reg_reconcile_endpoint() {
     current=$(jq -cer --arg n "$name" '.[$n] // empty' "$CB_REG") || status=2
   fi
   if [ "$status" -eq 0 ]; then
-    jq -e --arg pane "$expected_pane" '
-      .status == "open" and ((.pane // "") == $pane)
+    jq -e --arg pane "$expected_pane" --arg crew_id "$expected_crew_id" '
+      .status == "open" and ((.pane // "") == $pane) and
+      if $crew_id == "" then
+        ((.crew_id? | type) != "string" or (.crew_id | length) == 0)
+      else
+        .crew_id == $crew_id
+      end
     ' <<< "$current" >/dev/null || status=2
   fi
   if [ "$status" -eq 0 ]; then

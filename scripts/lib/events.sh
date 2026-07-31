@@ -138,7 +138,12 @@ cb_event_emit() {
   cb_lock_acquire "$CB_EVENT_LOCK" || return 1
 
   if [ -s "$CB_EVENT_SOURCE" ]; then
-    last=$(tail -n 1 "$CB_EVENT_SOURCE") || status=1
+    if ! tail -c 1 "$CB_EVENT_SOURCE" 2>/dev/null | { IFS= read -r; }; then
+      status=1
+    fi
+    if [ "$status" -eq 0 ]; then
+      last=$(tail -n 1 "$CB_EVENT_SOURCE") || status=1
+    fi
     if [ "$status" -eq 0 ]; then
       _cb_event_parse_last_seq "$last" || status=1
     fi
