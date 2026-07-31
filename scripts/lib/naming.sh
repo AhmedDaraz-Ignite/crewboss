@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # naming: task text in, crew name + branch out. Branch convention: {prefix}-{TICKET}-description
 # where TICKET is any Jira-style key (ABC-123) found in the task text.
 CB_PREFIX=${CB_PREFIX:-$(git config user.name 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')}
@@ -28,4 +29,16 @@ cb_name() {
   local ticket
   ticket=$(cb_ticket "$1")
   if [ -n "$ticket" ]; then printf '%s' "$ticket"; else cb_slug "$1"; fi
+}
+
+cb_agent_target() {
+  local target hash
+  target=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  if [[ $target =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+    printf '%s' "$target"
+    return
+  fi
+
+  hash=$(printf '%s' "$1" | git --git-dir=/dev/null/crewboss hash-object --stdin) || return 1
+  printf 'crew-%.27s' "$hash"
 }

@@ -18,7 +18,7 @@ crewboss wait ABC-123          # waits until the crew says it is done, then prin
 crewboss send ABC-123 "also fix the mobile layout"
 crewboss close ABC-123         # closes the window; files and conversation are kept
 crewboss open  ABC-123         # opens it again, right where it stopped
-crewboss remove ABC-123 -f     # deletes everything for this crew
+crewboss remove ABC-123 -f     # discards local work and deletes everything for this crew
 ```
 
 That is the whole idea: `spawn` a crew, `wait` for it, `send` more work, `close` when done.
@@ -125,6 +125,24 @@ brand new agent can lose the first message you send it (crewboss checks the mess
 arrived and sends it again if not).
 
 Crew records live in `~/.local/state/crewboss/crew.json`.
+
+## Safe cleanup
+
+`crewboss remove NAME` checks the worktree before it closes anything. It refuses
+uncommitted files and commits that are not present on a known remote. Push or commit
+the work and run the command again.
+
+`-f` means that you accept discarding local work. It never lets crewboss close a pane
+that belongs to another agent.
+
+crewboss also refuses to start a crew when its branch is checked out in your primary
+repo. A crew always runs in a separate worktree.
+
+## Checks
+
+```bash
+bash tests/run
+```
 
 ## License
 

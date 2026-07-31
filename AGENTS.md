@@ -19,15 +19,13 @@ commit, or installed copies teach the wrong thing.
 
 ## Commands
 
-There is no test suite and no CI. Checks are manual:
+Run the local check before handing off a change:
 
 ```bash
-bash -n scripts/crewboss scripts/lib/*.sh     # syntax only
-shellcheck scripts/crewboss scripts/lib/*.sh  # not pinned, not wired to anything yet
-scripts/crewboss help
+bash tests/run
 ```
 
-Real verification means running it inside a herdr pane against a git repo:
+Runtime verification means running it inside a disposable herdr pane against a git repo:
 
 ```bash
 scripts/crewboss spawn "ABC-123 try something"   # needs herdr + wt + jq, and a herdr pane as cwd

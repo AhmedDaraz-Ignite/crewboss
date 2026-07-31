@@ -3,10 +3,15 @@
 set -u
 
 CB_HOME=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/lib/naming.sh
 . "$CB_HOME/lib/naming.sh"
+# shellcheck source=scripts/lib/tree.sh
 . "$CB_HOME/lib/tree.sh"
+# shellcheck source=scripts/lib/pane.sh
 . "$CB_HOME/lib/pane.sh"
+# shellcheck source=scripts/lib/agent.sh
 . "$CB_HOME/lib/agent.sh"
+# shellcheck source=scripts/lib/registry.sh
 . "$CB_HOME/lib/registry.sh"
 
 usage() {
@@ -22,6 +27,9 @@ crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herd
   crewboss close <name>            close the pane; worktree and conversation are kept
   crewboss open  <name>            reopen the pane and resume the conversation
   crewboss remove <name> [-f]      full teardown: pane, worktree, registry entry
+
+remove refuses dirty or locally unpushed work. -f is explicit discard authority.
+crewboss verifies the live pane before closing it and never spawns in the primary checkout.
 
 The branch is derived from the task text: a Jira-style ticket key plus the first words become
 <prefix>-ABC-123-short-description. No ticket means <prefix>-<slug>. --branch overrides.
@@ -110,16 +118,25 @@ do_read() {
 }
 
 do_focus() {
+  local target
   require_crew "$1"
   [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is closed (crewboss open $1)"
-  herdr agent focus "$1" >/dev/null
+  target=$(cb_agent_target "$1") || return 1
+  herdr agent focus "$target" >/dev/null
+}
+
+close_crew() {
+  local name=$1
+  cb_pane_close "$(cb_reg_field "$name" pane)" "$name" ||
+    die "could not safely close '$name'"
+  cb_reg_put "$name" '{"status": "closed", "token": ""}' ||
+    die "could not update the crew registry"
 }
 
 do_close() {
   require_crew "$1"
   [ "$(cb_reg_field "$1" status)" = open ] || die "'$1' is already closed"
-  cb_pane_close "$(cb_reg_field "$1" pane)"
-  cb_reg_put "$1" '{"status": "closed", "token": ""}'
+  close_crew "$1"
   echo "closed $1 (worktree and conversation kept; crewboss open $1 to resume)"
 }
 
@@ -137,11 +154,28 @@ do_open() {
 }
 
 do_remove() {
-  local name=$1 force=${2:-}
+  if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    die "usage: crewboss remove <name> [-f]"
+  fi
+  local name=$1 force=${2:-} branch path
+  [ -z "$force" ] || [ "$force" = -f ] ||
+    die "usage: crewboss remove <name> [-f]"
+
   require_crew "$name"
-  [ "$(cb_reg_field "$name" status)" = open ] && cb_pane_close "$(cb_reg_field "$name" pane)"
-  cb_tree_remove "$(cb_reg_field "$name" branch)" "$force" || die "worktree removal failed (dirty? add -f)"
-  cb_reg_del "$name"
+  branch=$(cb_reg_field "$name" branch)
+  path=$(cb_reg_field "$name" path)
+  cb_tree_check_remove "$branch" "$path" "$force" ||
+    die "refusing to remove '$name'"
+
+  if [ "$(cb_reg_field "$name" status)" = open ]; then
+    close_crew "$name"
+  fi
+
+  cb_tree_check_remove "$branch" "$path" "$force" ||
+    die "'$name' changed while closing; worktree kept (crewboss open $name)"
+  cb_tree_remove "$branch" "$force" ||
+    die "worktree removal failed; crew kept closed (crewboss open $name)"
+  cb_reg_del "$name" || die "worktree removed but registry cleanup failed"
   echo "removed $name"
 }
 
@@ -156,7 +190,7 @@ case $cmd in
   focus)  [ $# -ge 1 ] || die "usage: crewboss focus <name>"; do_focus "$1" ;;
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
   open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
-  remove) [ $# -ge 1 ] || die "usage: crewboss remove <name> [-f]"; do_remove "$@" ;;
+  remove) do_remove "$@" ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;
 esac
