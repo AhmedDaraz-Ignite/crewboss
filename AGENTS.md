@@ -14,6 +14,9 @@ Consequence: `SKILL.md` is a shipped interface, equal in weight to the code. Any
 a flag, or a rule for the orchestrating agent has to land in `SKILL.md` and `README.md` in the same
 commit, or installed copies teach the wrong thing.
 
+## Commit & Push
+- NEVER commit or push to the main branch.
+
 ## Commands
 
 There is no test suite and no CI. Checks are manual:
