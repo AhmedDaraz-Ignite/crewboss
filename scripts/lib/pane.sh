@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # pane: where the crew session lives in herdr. The pane id path differs per command shape:
 # tab create and worktree open return .result.root_pane, pane split returns .result.pane.
 

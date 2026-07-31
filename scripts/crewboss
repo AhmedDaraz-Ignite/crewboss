@@ -3,10 +3,15 @@
 set -u
 
 CB_HOME=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/lib/naming.sh
 . "$CB_HOME/lib/naming.sh"
+# shellcheck source=scripts/lib/tree.sh
 . "$CB_HOME/lib/tree.sh"
+# shellcheck source=scripts/lib/pane.sh
 . "$CB_HOME/lib/pane.sh"
+# shellcheck source=scripts/lib/agent.sh
 . "$CB_HOME/lib/agent.sh"
+# shellcheck source=scripts/lib/registry.sh
 . "$CB_HOME/lib/registry.sh"
 
 usage() {

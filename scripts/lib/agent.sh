@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # agent: start, prompt, wait, read. All timeouts are internal - the interface never asks for one.
 CB_START_TIMEOUT_MS=120000   # startup readiness budget passed to herdr agent start
 CB_TASK_TIMEOUT_MS=1800000   # how long `crewboss wait` blocks for one task (30 min)

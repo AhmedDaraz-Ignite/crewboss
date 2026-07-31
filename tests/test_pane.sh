@@ -2,7 +2,9 @@
 set -u
 
 TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=tests/test_helper.sh
 source "$TEST_ROOT/test_helper.sh"
+# shellcheck source=scripts/lib/pane.sh
 source "$TEST_ROOT/../scripts/lib/pane.sh"
 
 HERDR_LOG=$(mktemp)

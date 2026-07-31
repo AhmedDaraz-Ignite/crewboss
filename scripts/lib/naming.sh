@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # naming: task text in, crew name + branch out. Branch convention: {prefix}-{TICKET}-description
 # where TICKET is any Jira-style key (ABC-123) found in the task text.
 CB_PREFIX=${CB_PREFIX:-$(git config user.name 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')}

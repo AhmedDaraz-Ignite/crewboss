@@ -595,6 +595,9 @@ git commit -m "fix: make crew removal fail closed"
 - Modify: `scripts/lib/pane.sh:1`
 - Modify: `scripts/lib/registry.sh:1`
 - Modify: `scripts/lib/tree.sh:1`
+- Modify: `tests/test_pane.sh:4-6`
+- Modify: `tests/test_remove.sh:5`
+- Modify: `tests/test_tree.sh:4-47`
 - Modify: `tests/run`
 
 **Interfaces:**
@@ -622,11 +625,21 @@ Add this first line to every `scripts/lib/*.sh` file:
 Add one exact source annotation before each dispatcher source:
 
 ```bash
-# shellcheck source=lib/naming.sh
+# shellcheck source=scripts/lib/naming.sh
 . "$CB_HOME/lib/naming.sh"
+# shellcheck source=scripts/lib/tree.sh
+. "$CB_HOME/lib/tree.sh"
+# shellcheck source=scripts/lib/pane.sh
+. "$CB_HOME/lib/pane.sh"
+# shellcheck source=scripts/lib/agent.sh
+. "$CB_HOME/lib/agent.sh"
+# shellcheck source=scripts/lib/registry.sh
+. "$CB_HOME/lib/registry.sh"
 ```
 
-Repeat with `tree.sh`, `pane.sh`, `agent.sh`, and `registry.sh`.
+Add source annotations for dynamic test imports. For test doubles that ShellCheck cannot
+trace through sourced production code, use a local `SC2329` disable immediately before
+the fake function.
 
 - [ ] **Step 3: Make the suite run syntax, help, and ShellCheck**
 

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # registry: one JSON file mapping crew name to branch, path, pane, agent kind, placement,
 # pending sentinel token, and open/closed status. This is what makes close and reopen possible.
 CB_STATE_DIR=${CB_STATE_DIR:-"$HOME/.local/state/crewboss"}

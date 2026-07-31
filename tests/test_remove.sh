@@ -3,6 +3,7 @@ set -u
 
 TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "$TEST_ROOT/.." && pwd)
+# shellcheck source=tests/test_helper.sh
 source "$TEST_ROOT/test_helper.sh"
 
 make_git_fixture() {

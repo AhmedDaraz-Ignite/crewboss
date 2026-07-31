@@ -2,6 +2,7 @@
 set -u
 
 TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "$TEST_ROOT/.." && pwd)
 status=0
 
 for test_file in "$TEST_ROOT"/test_*.sh; do
@@ -9,4 +10,8 @@ for test_file in "$TEST_ROOT"/test_*.sh; do
   bash "$test_file" || status=1
 done
 
-exit "$status"
+[ "$status" -eq 0 ] || exit "$status"
+
+bash -n "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh
+"$PROJECT_ROOT/scripts/crewboss" help >/dev/null
+shellcheck "$PROJECT_ROOT/scripts/crewboss" "$PROJECT_ROOT"/scripts/lib/*.sh

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # tree: worktree lifecycle via worktrunk. wt owns the path template and post-switch hooks.
 # The base ref defaults to the remote's default branch. Override with CB_BASE.
 

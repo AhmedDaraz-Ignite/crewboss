@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install shell tools
+        run: sudo apt-get update && sudo apt-get install --yes jq shellcheck
+      - name: Run behavior and static checks
+        run: bash tests/run
