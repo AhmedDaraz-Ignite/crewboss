@@ -62,23 +62,24 @@ Public social-media ingestion, a hosted control plane, and an exact copy of anot
 
 ## 4. Current baseline
 
+This revision uses CrewBoss main commit `c165d61`, the merge commit for PR #2, as its repository baseline.
+
 CrewBoss today is a small Bash tool published as an agent skill. It already has valuable design choices:
 
 - The public command uses a crew name, not a pane identifier or filesystem path.
 - Worktrunk owns worktrees.
 - Herdr owns panes and agent processes.
-- CrewBoss owns only its registry.
-- A completion token works around known terminal-state races.
+- CrewBoss owns its registry, event log, and event-delivery checkpoint.
+- Workers report `blocked` and `done` through `crewboss emit` with stored crew and run identities.
+- `events.jsonl` is append-only and ordered by a validated sequence number.
+- `event-state.json` provides a cursor and pending checkpoint for at-least-once delivery.
+- `wait` accepts several crews and returns the oldest selected event in FIFO order.
+- Missing endpoints are reconciled without treating terminal text as completion.
+- Registry and event writes use locks.
 - `close` and `open` preserve a crew across session teardown.
 - The product is easy to install and understand.
 
-The Phase 1 event-log work also provides useful migration input:
-
-- append-only completion and blocked events;
-- sequence numbers and event identifiers;
-- locked registry writes;
-- multi-crew waits;
-- stale endpoint reconciliation.
+These event capabilities landed on main in PR #2 and form the verified Bash migration baseline. They are current behavior, not future roadmap work.
 
 These strengths should remain visible to users. The following limitations must not remain in the 1.0 architecture:
 
@@ -86,8 +87,7 @@ These strengths should remain visible to users. The following limitations must n
 - operations that depend on the caller's current repository;
 - non-transactional worktree and pane creation;
 - hard-coded unsafe agent flags;
-- completion inferred from terminal text;
-- screen snapshots treated as transcripts;
+- no durable worker transcript beyond explicit event payloads; `read` remains a visible-screen snapshot;
 - no project registry, backlog, dependency graph, verification, or delivery model;
 - no stable machine-readable CLI contract;
 - no persistent background supervisor;
@@ -249,13 +249,15 @@ The service owns scheduling and deterministic state transitions. The attached co
 - Detaching the boss never stops workers or loses events.
 - If no boss is attached, actionable events stay queued and may trigger an OS notification.
 
-There is no required cloned coordinator home. An agent in any terminal can attach if it has access to the same local socket and passes the authority check.
+There is no required cloned coordinator home. An agent in any terminal can attach after an operator-authorized attach flow issues a short-lived boss credential. The credential remains outside worker sandboxes. Access to the local socket or matching user ID alone is not enough.
 
 ### 9.3 Storage choice
 
 SQLite 3 in write-ahead logging mode is authoritative. The service serializes state-changing transactions and allows concurrent read snapshots.
 
 The database opens with foreign-key enforcement, a bounded busy timeout, and full synchronous durability. State mutations use immediate write transactions. Per-home event sequence allocation happens inside the same transaction as the domain change. Backups use SQLite's online backup mechanism or a service-owned checkpoint and snapshot; copying a live database and ignoring its WAL file is forbidden.
+
+The reference build uses `modernc.org/sqlite` through Go's `database/sql`. It is a CGo-free SQLite implementation, so release builds can cross-compile for supported macOS and Linux targets without a platform C toolchain. Replacing it with a CGo driver requires a new architecture decision and release-pipeline proof.
 
 JSONL may be exported for debugging or audit review. It is not a second source of truth.
 
@@ -296,7 +298,7 @@ The target repository layout is:
 │       └── forge/
 ├── migrations/                   # embedded SQLite migrations
 ├── scripts/crewboss              # temporary compatibility shim
-├── lib/                          # old Bash implementation during migration
+├── scripts/lib/                  # old Bash implementation during migration
 ├── tests/
 │   ├── contract/
 │   ├── integration/
@@ -320,6 +322,8 @@ The full product should support:
 
 The existing `npx skills add AhmedDaraz-Ignite/crewboss` flow remains a skill-only installation path. If the binary is absent, the skill prints exact binary installation instructions. It must not silently download and execute a binary.
 
+Release CI publishes platform archives and a SHA-256 checksum manifest. It signs the manifest with Sigstore keyless signing through GitHub Actions OIDC. Verification pins the expected repository, workflow identity, and OIDC issuer. macOS binaries also use Apple Developer ID signing and notarization. Homebrew formulas pin the archive checksum. The self-update path verifies the same identity, signature, and checksum before it offers installation.
+
 ### 11.2 CrewBoss homes
 
 Named homes isolate independent fleets, for example `work` and `personal`.
@@ -331,10 +335,11 @@ $XDG_CONFIG_HOME/crewboss/config.toml
 $XDG_STATE_HOME/crewboss/<home>/state.db
 $XDG_DATA_HOME/crewboss/<home>/artifacts/
 $XDG_DATA_HOME/crewboss/<home>/briefs/
-$XDG_RUNTIME_DIR/crewboss/<home>.sock
+$XDG_RUNTIME_DIR/crewboss/<home>/control.sock
+$XDG_RUNTIME_DIR/crewboss/<home>/runs/<run-id>.sock
 ```
 
-State directories use mode `0700`; databases, tokens, and sensitive configuration use `0600`. The daemon refuses a socket or state directory owned by another user.
+State and runtime directories use mode `0700`; databases, tokens, and sensitive configuration use `0600`. The daemon refuses a socket or state directory owned by another user. The control socket is never mounted into a worker sandbox. A run socket is removed when its capability is revoked.
 
 ### 11.3 Configuration
 
@@ -415,15 +420,15 @@ The service rejects self-dependencies and cycles. Initial `kind` values are `blo
 
 #### `briefs`
 
-Fields: `id`, `job_id`, `run_id`, `schema_version`, `content_sha256`, `content_json`, `rendered_artifact_id`, `created_by`, `created_at`.
+Fields: `id`, `job_id`, `schema_version`, `content_sha256`, `content_json`, `rendered_artifact_id`, `created_by`, `created_at`.
 
-A brief is immutable after its run starts. `(run_id, content_sha256)` is unique.
+A brief is immutable after its linked run starts. `runs.brief_id` is a non-null unique foreign key, so the run owns the only database relationship and exactly one run uses each brief. The service pre-generates both UUIDs, verifies that the brief and run use the same job, and inserts them in one transaction. `rendered_artifact_id` may be null until rendering finishes.
 
 #### `runs`
 
 Fields: `id`, `job_id`, `attempt`, `state`, `brief_id`, `base_ref`, `base_sha`, `branch`, `worktree_path`, `endpoint_id`, `worker_identity`, `capability_hash`, `capability_expires_at`, `head_sha`, `result_summary`, `failure_code`, `generation`, `created_at`, `dispatched_at`, `started_at`, `heartbeat_at`, `finished_at`.
 
-`(job_id, attempt)` is unique. A retry always creates a new row.
+`(job_id, attempt)` and `brief_id` are unique. A retry always creates a new run and a new brief.
 
 #### `endpoints`
 
@@ -514,7 +519,7 @@ Each run has one immutable brief. The file and database record include:
 - worker event protocol;
 - base revision and project identity.
 
-Editing a job after dispatch does not edit the active brief. The coordinator must cancel and create a new run, or send an explicitly recorded amendment.
+Editing a job after dispatch does not edit the active brief. A small clarification creates an immutable `run.amended` event and amendment artifact; it does not create another brief row. A change to scope, authority, acceptance criteria, base revision, or delivery mode requires cancelling the run and creating a new run with a new brief.
 
 ## 13. State machines
 
@@ -525,26 +530,30 @@ State axes remain separate. A missing terminal pane must not automatically mean 
 ```text
 draft -> queued -> dispatching -> active
 active -> blocked -> active
+active|blocked -> paused -> active|blocked
 active -> verifying
 verifying -> waiting -> verifying
 verifying -> ready
 ready -> waiting -> ready
 ready -> complete
 dispatching -> queued            (safe dispatch recovery)
-active|verifying|waiting -> failed
+active|blocked|verifying|waiting -> failed
 failed -> queued                 (retry)
-draft|queued|active|blocked|waiting -> cancelled
+draft|queued|dispatching|active|blocked|paused|verifying|waiting|ready -> cancelled
 ```
 
 `waiting` means CrewBoss is waiting for a named external condition, such as CI or an approval. `state_reason` identifies that condition. `ready` means required evidence is valid and delivery may proceed.
+
+Cancelling during `dispatching` first marks the dispatch operation `cancel_requested`. The service unwinds or records every external saga step before it commits `cancelled`. If cleanup cannot finish, the job remains visible with `state_reason=cancel_cleanup`; it is never hidden as successfully cancelled.
 
 ### 13.2 Run state
 
 ```text
 preparing -> dispatched -> active -> succeeded
-preparing|dispatched|active -> failed
 dispatched|active -> blocked -> active
-preparing|dispatched|active|blocked -> cancelled
+active|blocked -> suspended -> active|blocked
+preparing|dispatched|active|blocked|suspended -> failed
+preparing|dispatched|active|blocked|suspended -> cancelled
 dispatched|active|blocked -> lost
 ```
 
@@ -577,6 +586,8 @@ open -> superseded
 open -> expired
 ```
 
+Expiry does not guess an answer and does not mark the run successful or failed. The run and job remain blocked with `state_reason=decision_expired`. The service emits an urgent boss event. The operator may cancel or retry the job, or provide an answer that creates a replacement decision linked to the expired one and resumes the worker if its endpoint is still usable.
+
 All transitions are checked in the domain layer and committed with the expected generation. A stale caller receives `state_conflict`; it does not overwrite newer state.
 
 ## 14. Event and worker protocol
@@ -586,7 +597,7 @@ All transitions are checked in the domain layer and committed with the expected 
 Workers use internal commands supplied in their brief:
 
 ```bash
-crewboss worker event progress --message-file progress.md
+crewboss worker progress --message-file progress.md
 crewboss worker question --key choose-api --message-file question.md
 crewboss worker complete --summary-file result.md --artifact report.md
 crewboss worker fail --code tests_failed --message-file failure.md
@@ -602,6 +613,8 @@ The token is:
 - limited to the worker event actions;
 - short-lived and renewable only while the run is active;
 - revoked when the run ends or is replaced.
+
+An authenticated heartbeat received before expiry extends `capability_expires_at` while the run is active, capped by the configured maximum run lifetime. It renews the existing opaque token; there is no separate renewal endpoint. An expired token cannot renew itself.
 
 The service validates the token and writes the event and state transition before acknowledging it. A worker may retry after a lost response without creating a duplicate because every mutation carries an idempotency key.
 
@@ -642,8 +655,8 @@ The stable event representation is:
 The initial stable event namespace includes:
 
 - `project.added`, `project.changed`, `project.archived`;
-- `job.created`, `job.queued`, `job.blocked`, `job.ready`, `job.completed`, `job.failed`, `job.cancelled`;
-- `run.preparing`, `run.started`, `run.progress`, `run.question`, `run.completed`, `run.failed`, `run.lost`;
+- `job.created`, `job.queued`, `job.blocked`, `job.suspended`, `job.resumed`, `job.ready`, `job.completed`, `job.failed`, `job.cancelled`;
+- `run.preparing`, `run.started`, `run.progress`, `run.question`, `run.amended`, `run.suspended`, `run.resumed`, `run.completed`, `run.failed`, `run.lost`;
 - `endpoint.changed`, `endpoint.missing`;
 - `decision.opened`, `decision.answered`, `decision.expired`;
 - `check.started`, `check.passed`, `check.failed`, `check.invalidated`;
@@ -657,7 +670,7 @@ New event kinds may be added in a minor protocol version. Existing meanings must
 
 ### 14.4 Bash compatibility protocol
 
-During migration, the existing completion sentinel remains only inside the Bash adapter. The adapter translates a confirmed sentinel into one `run.completed` call. Once a worker supports the explicit protocol, terminal text is never consulted for completion.
+During migration, the Bash adapter reads the legacy `events.jsonl` records that workers append with `crewboss emit` (`blocked` and `done`). It maps `blocked` to a free-text `run.question` and `done` to `run.completed`, using the stored legacy `crew_id` and `run_id`. The legacy `event_id` becomes the deduplication key, and the raw payload is preserved. Terminal text is never consulted for completion.
 
 ## 15. Public CLI contract
 
@@ -672,9 +685,9 @@ crewboss config show|validate
 crewboss daemon start|status|stop|serve
 
 crewboss project add|list|show|sync|pause|archive|remove
-crewboss boss attach|status|wake|mode|detach|resume
+crewboss boss attach|status|wake|mode|detach
 crewboss job create|dispatch|list|show|wait|send|answer
-crewboss job cancel|retry|promote|close|remove
+crewboss job cancel|retry|promote|suspend|resume|remove
 crewboss job diff|logs|report|verify|deliver
 crewboss lead create|list|show|route|pause|resume|retire
 crewboss approval list|show|grant|deny
@@ -691,7 +704,7 @@ spawn send wait read focus close open remove list
 
 Aliases accept the old arguments, print one clear deprecation warning in human mode, and map to a project-scoped job when unambiguous. They never ask for pane IDs, worktree paths, or internal timeouts.
 
-`close` releases a live worker endpoint while preserving durable run state. `open` restores or replaces that endpoint through a recorded operation. `remove` safely cleans CrewBoss-owned runtime resources and archives the logical job; it does not erase events, approvals, or audit evidence.
+The compatibility alias `close` maps to `job suspend`. It records the job and run as suspended before safely closing the worker endpoint. The alias `open` maps to `job resume`. Resume restores the same run only when the harness adapter reports verified resume support; otherwise it returns `backend_unavailable` and recommends `job retry`. `remove` maps to `job remove`, safely cleans CrewBoss-owned runtime resources, and archives the logical job. It does not erase events, approvals, or audit evidence.
 
 ### 15.2 Names and selectors
 
@@ -702,7 +715,28 @@ Aliases accept the old arguments, print one clear deprecation warning in human m
 - UUIDs are accepted for automation but are not the normal user interface.
 - Internal pane, process, and worktree identifiers do not appear as required arguments.
 
-### 15.3 JSON envelope
+### 15.3 Naming derivation
+
+Naming carries forward today's `scripts/lib/naming.sh` derivation rules, with one explicit normalization change: canonical job names are lowercase. Contract fixtures record both the preserved rules and that change.
+
+1. An explicit `--name` wins after validation and lowercase normalization.
+2. Otherwise CrewBoss takes the first Jira-style key matching `[A-Za-z][A-Za-z0-9]+-[0-9]+` and lowercases it for the job name, so `CB-142 add retry limits` becomes `cb-142`.
+3. With no ticket, CrewBoss removes ticket-like text, lowercases the task, replaces non-alphanumeric runs with spaces, takes the first four words, and joins them with `-`.
+4. Empty derived names fail with `invalid_argument`.
+5. A name collision inside the project fails with `state_conflict` and asks for `--name`; CrewBoss never silently attaches to the existing job or adds a random suffix.
+
+Branch derivation keeps the current convention:
+
+- explicit `--branch` wins;
+- otherwise the prefix comes from project `branch_prefix`, then compatibility variable `CB_PREFIX`, then normalized Git `user.name`, with `crew` as the final fallback;
+- a ticket and slug produce `<prefix>-<TICKET>-<slug>`;
+- a ticket alone produces `<prefix>-<TICKET>`;
+- a slug alone produces `<prefix>-<slug>`;
+- explicit `--base` wins, then the registered project base branch, then compatibility variable `CB_BASE` during the Bash migration window.
+
+The ticket remains uppercase in the branch for compatibility. Imported uppercase crew names remain accepted aliases for their canonical lowercase job names. Go contract tests use the existing Bash naming fixtures before the Bash engine is frozen.
+
+### 15.4 JSON envelope
 
 Every command supports `--json`. Success uses:
 
@@ -736,11 +770,12 @@ Failure uses:
 
 JSON output writes only the envelope to standard output. Human diagnostics go to standard error. Commands that mutate state accept `--request-id`; retrying the same request returns the original result or its current operation record.
 
-### 15.4 Exit codes
+### 15.5 Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | Success. |
+| 1 | Reserved. CrewBoss never intentionally returns it; a shell or operating-system failure may still produce it. |
 | 2 | Invalid command or arguments. |
 | 3 | Requested object not found. |
 | 4 | State or generation conflict. |
@@ -752,13 +787,13 @@ JSON output writes only the envelope to standard output. Human diagnostics go to
 
 Stable error codes include `invalid_argument`, `not_found`, `ambiguous_selector`, `state_conflict`, `approval_required`, `policy_refused`, `backend_unavailable`, `external_retryable`, `invalid_capability`, `unsupported_protocol`, `integrity_failure`, and `internal`. A new code may be added in version 1, but the meaning of an existing code cannot change.
 
-### 15.5 API boundary
+### 15.6 API boundary
 
 The local service exposes versioned HTTP/JSON over its Unix socket. The CLI is the supported public client in 1.0. The API schema is documented and tested so later graphical or remote clients do not need database access.
 
 Clients never write SQLite directly. Unsupported protocol versions fail clearly. A one-minor-version compatibility window is required during upgrades.
 
-### 15.6 Local API resources
+### 15.7 Local API resources
 
 The initial resource map is:
 
@@ -795,9 +830,13 @@ POST   /v1/worker/events
 POST   /v1/worker/heartbeat
 ```
 
+The two `/v1/worker/*` routes are served only through the run-specific ingress. They are not exposed by the control socket.
+
 Mutations require `X-CrewBoss-Request-ID`. Conditional aggregate updates use `If-Match: <generation>`. Event streaming uses server-sent events and resumes with `Last-Event-ID`; `GET /v1/events` remains the durable catch-up path.
 
-The operator CLI is authenticated by the owner-only socket and operating-system peer identity. A boss call also needs its lease credential. Worker calls use only their scoped bearer capability. No API accepts a caller role from an untrusted request body.
+Socket ownership and operating-system peer identity prove only that a caller belongs to the local user account. They do not prove that the process is the operator, boss, or worker. Control requests therefore also require a role credential outside the worker sandbox. Approval grants require a fresh local TTY confirmation or another supported attested operator action; same-user peer credentials alone never grant approval authority.
+
+Workers do not receive the control socket. Each run receives a separate ingress socket or inherited file descriptor that exposes only worker events and heartbeat, plus its scoped bearer capability. The harness sandbox must deny the control socket, SQLite state, configuration, other run directories, and boss or operator credentials. No API accepts a caller role from an untrusted request body.
 
 ## 16. Job types and brief creation
 
@@ -966,7 +1005,7 @@ Required operations:
 - `RequestStop`
 - `Version`
 
-Each adapter declares support for resume, non-interactive input, structured hooks, permission controls, model selection, and reasoning-effort selection. CrewBoss must not claim a capability that has not passed a live test.
+Each adapter declares support for resume, non-interactive input, structured hooks, permission controls, model selection, reasoning-effort selection, and worker filesystem isolation. CrewBoss must not claim a capability that has not passed a live test.
 
 Claude and Codex are required for 1.0. OpenCode is the next supported harness. Additional harnesses use the same contract.
 
@@ -987,6 +1026,8 @@ GitHub through `gh` is the reference adapter. GitLab follows after the GitHub co
 ### 19.5 Capability negotiation
 
 Every adapter returns a versioned capability document. A workflow fails before side effects if required capabilities are missing. Experimental support appears in `doctor` and JSON output; it is never described as verified support.
+
+Harness capability documents report `worker_isolation` as `enforced`, `advisory`, or `none`. `enforced` requires a live conformance probe proving that the worker cannot open the control socket, state database, config, boss credentials, or another run directory while it can still use its own worktree and event ingress. `doctor` runs this probe for every supported harness and profile. A version change invalidates the cached result until the probe passes again.
 
 ## 20. Supervision, wake-up, and recovery
 
@@ -1067,12 +1108,16 @@ Each action records its actor and effective authority.
 
 | Profile | Intended behavior |
 | --- | --- |
-| `safe` | Read repository data and prepare plans or reports. No source mutation or network delivery. |
-| `standard` | Work inside an isolated worktree, run declared checks, and prepare delivery. Merge and destructive cleanup need approval. |
-| `autonomous` | Perform pre-approved project actions, including selected delivery operations, within exact policy limits. |
-| `unsafe-host` | Broad host access for controlled environments only. Requires explicit operator activation and expires. |
+| `safe` | Use an enforced sandbox to read allowed repository data and prepare plans or reports. No source mutation or network delivery. |
+| `standard` | Use an enforced sandbox and isolated worktree, run declared checks, and prepare delivery. Merge and destructive cleanup need approval. |
+| `autonomous` | Use an enforced sandbox to perform pre-approved project actions, including selected delivery operations, within exact policy limits. |
+| `unsafe-host` | Run without a verified same-user isolation boundary. Intended only for controlled environments. Requires explicit operator activation and expires. |
 
 No harness receives a dangerous bypass flag merely because it is installed. The harness adapter translates a CrewBoss permission profile to supported vendor controls and reports any gap.
+
+`safe`, `standard`, and `autonomous` require `worker_isolation=enforced`. Their sandbox denies the CrewBoss control socket, state and configuration roots, operator and boss credentials, unrelated worktrees, and other run directories. It exposes only the run's worktree, declared tool paths, and per-run event ingress. Dispatch fails closed if any required denial cannot be proved.
+
+`unsafe-host` is the compatibility escape hatch for a harness that cannot enforce these denials. In that profile, scoped APIs and policy reduce accidental or confused-deputy mistakes, but they do not defend against a hostile process running under the same OS user. The CLI must show this limitation before dispatch and store the operator's expiring approval.
 
 ### 21.3 Actions requiring approval by default
 
@@ -1092,7 +1137,7 @@ Creating a job, sending a message to its worker, reading owned state, and stoppi
 
 An approval records action, exact target, scope, approver identity, method, expiry, and whether it is single-use. The service hashes the receipt and binds it to the external operation. Changing the action invalidates the approval.
 
-The attached agent cannot approve its own request. Strong approval comes from a local operator interaction or a supported attested user action. A plain worker message is never accepted as operator approval.
+The attached agent cannot approve its own request. Strong approval comes from a fresh local operator interaction or a supported attested user action. A same-user socket peer, boss message, or worker message is never accepted as operator approval. Reusable approval credentials remain outside every worker sandbox.
 
 ### 21.5 Repository trust boundary
 
@@ -1103,8 +1148,12 @@ Repository files, issue text, worker output, and pull-request comments are untru
 - Paths are resolved and checked against allowed roots.
 - Symlink traversal is checked before writes and cleanup.
 - Logs redact registered secrets and capabilities.
-- Worker tokens cannot call boss, approval, configuration, or delivery APIs.
+- Enforced worker sandboxes cannot open the control socket, state database, config, or another run's files.
+- The per-run ingress exposes only heartbeat and worker event actions; its token cannot call boss, approval, configuration, or delivery APIs.
+- Direct database access is a trusted service operation. File mode `0600` protects against other OS users, not another process with the same UID.
 - Forge comments cannot change authority without operator confirmation.
+
+These are security guarantees only for adapters whose live isolation probe passes. Under `unsafe-host`, they are API rules rather than a boundary against malicious same-UID code.
 
 ## 22. Verification and delivery
 
@@ -1233,14 +1282,14 @@ Thresholds live in configuration. They are not public CLI timeout arguments on e
 
 ### 25.1 Compatibility promise
 
-The old commands remain supported through at least two minor releases after the Go core becomes default. Removal requires telemetry-free local warning counts or explicit user confirmation; CrewBoss does not send usage data by default.
+The old commands remain supported through the full 1.x release line. They may be removed only in 2.0 or later, after deprecation warnings have shipped in at least two minor releases and the published migration guide is complete. Removal depends on this version window, not a machine-local usage counter. CrewBoss sends no usage telemetry by default.
 
 ### 25.2 Imported state
 
 The migration tool reads, without modifying:
 
 - current `crew.json` registry;
-- Phase 1 `events.jsonl`, when present;
+- the merged PR #2 `events.jsonl` and `event-state.json` formats;
 - known CrewBoss-owned Worktrunk worktrees;
 - known Herdr endpoints.
 
@@ -1248,7 +1297,7 @@ The migration tool reads, without modifying:
 
 ### 25.3 Mapping
 
-- old crew name -> project-scoped job name;
+- old crew name -> project-scoped canonical job name plus a compatibility alias preserving the old case;
 - old branch/path/pane/agent -> first imported run and endpoint;
 - old `task` and latest prompt -> job objective and run amendment history;
 - old blocked/done event -> durable event with imported source metadata;
@@ -1263,37 +1312,38 @@ During the bridge release:
 - `CREWBOSS_ENGINE=bash` selects the old implementation;
 - `CREWBOSS_ENGINE=service` selects the new implementation;
 - the default changes only after contract and migration tests pass;
+- the Bash engine is frozen as a rollback path and does not implement `crewboss.cli.v1`;
 - rollback keeps the pre-migration backup and does not pretend new service state can always be represented by the old registry.
 
 ## 26. Incremental roadmap
 
-Each phase is independently releasable. Reliability gates are mandatory even when they take more work. Human development cost is not used to remove a correctness requirement.
+Each release is independently releasable. Reliability gates are mandatory even when they take more work. Human development cost is not used to remove a correctness requirement. Version names replace numbered roadmap phases so they cannot collide with the repository's historical phase documents and branch names.
 
-### Phase 0 — v0.2: Stabilize the current contract
+### v0.2: Confirm and tag the event baseline
 
-**Objective:** Make the current Bash product a trustworthy migration source.
+**Objective:** Verify merged PR #2 as the trustworthy Bash migration source and tag it. The event implementation is already on main; this release does not plan it again.
 
 **Deliver:**
 
-- reconcile and land the Phase 1 durable event work;
-- locked and failure-aware registry updates;
-- unique crew/run identities in stored records;
-- documented event meaning and wait behavior;
-- stale endpoint reconciliation;
-- honest Claude and Codex capability notes;
-- current README, `SKILL.md`, and CLI help in sync.
+- run the event, wait, registry, endpoint-reconciliation, and full repository suites against current main;
+- capture migration fixtures for `crew.json`, `events.jsonl`, `event-state.json`, and naming derivation;
+- confirm strict sequence validation, locked writes, crew/run identity checks, FIFO selection, pending checkpoints, and at-least-once recovery;
+- confirm README, `SKILL.md`, CLI help, and `AGENTS.md` describe the merged behavior;
+- record verified and experimental harness capabilities;
+- tag the accepted mainline as v0.2, fixing only gaps found by this gate.
 
-**Public surface:** Existing commands plus multi-name `wait` and durable blocked/completed events.
+**Public surface:** Existing commands, multi-name `wait`, and durable `blocked` and `done` events through `crewboss emit`.
 
 **Acceptance gate:**
 
-- all existing tests pass;
-- concurrent event writers produce no lost or malformed lines;
-- a restart does not redeliver an acknowledged event as new;
-- a missing pane never becomes successful only from registry state;
-- docs describe exactly what is verified and what remains experimental.
+- all current main tests pass;
+- concurrent event writers produce no lost or malformed records;
+- a crash after event output may replay the pending event but cannot lose it;
+- a missing pane never becomes successful only from endpoint state;
+- no runtime path uses terminal text or a `TASKDONE` sentinel as completion;
+- documentation states exactly what is verified and what remains experimental.
 
-### Phase 1 — v0.3: Trustworthy Bash bridge
+### v0.3: Trustworthy Bash bridge
 
 **Objective:** Remove the largest safety and interface risks before changing languages.
 
@@ -1302,27 +1352,26 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - project identity on every crew;
 - commands independent of current working directory;
 - provisional registry records and compensation for spawn/open failures;
-- strict option parsing and stable exit codes;
-- `--json` envelope version 1 for existing commands;
-- idempotent request identifiers for mutations;
 - no hard-coded unsafe harness mode;
 - `doctor` with adapter and version checks;
-- normalized adapter capability report;
-- explicit labels for pane snapshots.
+- explicit labels for pane snapshots;
+- frozen behavior and naming fixtures for the rollback engine.
 
-**Public surface:** `doctor`, `--json`, `--request-id`, project-qualified crew selectors.
+This release fixes Bash safety and repository-scoping defects only. It does not implement `crewboss.cli.v1`, request idempotency, or the new exit-code contract. Those fixtures are written now, but Go is their only implementation in v0.4.
+
+**Public surface:** `doctor`, project-qualified crew selectors, and otherwise frozen human-oriented Bash commands.
 
 **Acceptance gate:**
 
 - two repositories may use the same crew name without collision;
 - `remove`, `close`, and `open` work from a third directory;
 - injected failures at every spawn step leave either no resource or a recorded recoverable resource;
-- malformed and repeated flags fail with exit code 2;
-- JSON output passes a stored schema contract;
 - live Herdr and Worktrunk smoke tests pass;
-- dangerous harness permissions require explicit configuration.
+- dangerous harness permissions require explicit configuration;
+- the Bash engine has no new JSON envelope or idempotency implementation;
+- frozen rollback and naming fixtures pass.
 
-### Phase 2 — v0.4: Durable Go core
+### v0.4: Durable Go core
 
 **Objective:** Introduce the service and SQLite without changing normal user commands.
 
@@ -1330,28 +1379,33 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 
 - Go CLI and Unix-socket service;
 - XDG home layout and owner-only permissions;
-- SQLite migrations and WAL configuration;
+- SQLite migrations and WAL configuration through `modernc.org/sqlite`;
 - core projects, jobs, runs, endpoints, events, cursors, requests, operations, leases, and audit tables;
 - transactional domain state changes;
 - idempotent command API;
+- the only implementation of `crewboss.cli.v1`, stable exit codes, and `--request-id`;
+- contract fixtures written before the service implementation;
 - Bash CLI shim and engine switch;
 - `migrate inspect` and `migrate apply`;
 - service-owned backup creation, verification, and restore;
-- signed release build pipeline and checksums.
+- Sigstore-signed release checksums, plus Developer ID signing and notarization on macOS.
 
 **Public surface:** `daemon`, `config`, `backup`, `migrate`, and compatibility commands backed by the service.
 
 **Acceptance gate:**
 
-- old contract tests pass against both engines;
-- migration fixtures from main and Phase 1 import without data loss;
+- frozen Bash regression tests pass for the rollback engine without requiring v1 JSON output;
+- `crewboss.cli.v1` fixtures pass against the Go engine only;
+- current main migration fixtures import without data loss;
 - killing the service between external saga steps recovers safely;
 - 100 concurrent event writes have unique ordered sequences and no loss;
 - stale generations cannot overwrite new state;
 - the socket refuses another local user;
+- same-user peer credentials alone cannot obtain operator, boss, or approval authority;
+- the reference binary builds with `CGO_ENABLED=0` for macOS and Linux on amd64 and arm64, and release verification accepts only the pinned signing identity and checksums;
 - a clean rollback to the stored backup is documented and tested before new-only work is created.
 
-### Phase 3 — v0.5: Projects and Jobs
+### v0.5: Projects and Jobs
 
 **Objective:** Add the durable multi-project work model.
 
@@ -1363,7 +1417,8 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - job dependencies with cycle detection;
 - deterministic scheduler and concurrency limits;
 - dispatch saga with worktree and endpoint recovery;
-- explicit worker event commands and scoped capabilities;
+- explicit worker event commands, per-run ingress, and scoped capabilities;
+- enforced worker isolation for `safe`, `standard`, and `autonomous` profiles;
 - Explore reports and promotion to Build;
 - project, job, diff, logs, and report commands.
 
@@ -1374,13 +1429,14 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - register three repositories and dispatch ten jobs without name collision;
 - dependency order is stable and explainable;
 - a worker retry cannot duplicate completion or a question;
-- a capability for one run cannot read or mutate another run;
+- with `worker_isolation=enforced`, a worker cannot open the control socket, state database, config, credentials, or another run's files;
+- without enforced isolation, safe profiles refuse dispatch and only explicitly approved `unsafe-host` is available;
 - Explore cannot enter code delivery;
 - promotion begins from a clean current base;
 - no coordinator write occurs in a primary checkout;
 - every failed dispatch step is reconciled or safely compensated.
 
-### Phase 4 — v0.6: Always-on supervision
+### v0.6: Always-on supervision
 
 **Objective:** Continue supervision without an always-running model conversation.
 
@@ -1408,7 +1464,7 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - blocked questions remain queued for at least seven days or configured retention;
 - supervisor retries are bounded and visible.
 
-### Phase 5 — v0.7: Verification and delivery
+### v0.7: Verification and delivery
 
 **Objective:** Turn worker output into evidence-backed results.
 
@@ -1436,7 +1492,7 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - cleanup refuses dirty or unowned resources;
 - delivery evidence identifies exact base and head SHAs.
 
-### Phase 6 — v0.8: Crew Leads and fleet routing
+### v0.8: Crew Leads and fleet routing
 
 **Objective:** Add persistent domain supervision and clear fleet-wide routing.
 
@@ -1461,7 +1517,7 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - idle leads consume no model tokens;
 - restart restores lead queues and endpoint state.
 
-### Phase 7 — v0.9: Runtime portability and controlled autonomy
+### v0.9: Runtime portability and controlled autonomy
 
 **Objective:** Make orchestration portable and safe for longer unattended periods.
 
@@ -1470,11 +1526,11 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - Tmux session adapter at reference quality;
 - Claude and Codex harness adapters at verified quality;
 - OpenCode adapter at verified or clearly experimental quality;
-- permission-profile translation and gap reporting;
+- permission-profile translation, isolation conformance probes, and gap reporting;
 - autonomous mode with scoped, expiring policy grants;
 - webhook or local notification connector interface;
 - GitLab forge adapter;
-- self-update check with signed artifacts and explicit install approval;
+- self-update verification for the pinned Sigstore identity, checksum manifest, and macOS notarization, with explicit install approval;
 - fault-injection and adapter conformance suites.
 
 **Public surface:** adapter selection, permission profiles, `boss mode autonomous`, update status.
@@ -1484,12 +1540,13 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 - the same Build and Explore contract passes on Herdr and Tmux;
 - Claude and Codex both complete the explicit worker protocol live tests;
 - unavailable resume or permission features are reported before dispatch;
+- `doctor` proves each supported safe profile denies control and state paths before it reports `worker_isolation=enforced`;
 - autonomous mode cannot merge or perform destructive cleanup beyond its exact grant;
 - expired grants fail closed;
-- update verification rejects an unsigned or checksum-mismatched binary;
+- update verification rejects a wrong signing identity, unsigned manifest, checksum mismatch, or missing required macOS signature/notarization;
 - GitHub and GitLab delivery share the same domain behavior.
 
-### Phase 8 — v1.0: Competitor-ready release
+### v1.0: Competitor-ready release
 
 **Objective:** Prove the full product as one reliable system.
 
@@ -1519,27 +1576,28 @@ Each phase is independently releasable. Reliability gates are mandatory even whe
 
 This matrix tracks the user outcome, not identical implementation.
 
-| Capability | CrewBoss today | Target phase | CrewBoss outcome |
+| Capability | CrewBoss today | Target release | CrewBoss outcome |
 | --- | --- | --- | --- |
-| Agent-loadable instructions | Yes | 0 | Keep `SKILL.md` as the trigger and protocol guide. |
-| Durable completion events | Partial prototype | 0–2 | Transactional ordered event stream with cursors. |
-| Safe multi-repository state | No | 1–3 | Project registry and project-scoped names. |
-| Stable machine protocol | No | 1–2 | Versioned JSON CLI and socket API. |
-| Durable backlog/jobs | No | 3 | Jobs, runs, dependencies, briefs, and artifacts. |
-| Implementation workflow | Basic spawn | 3–5 | Build jobs with verification and delivery. |
-| Investigation workflow | No | 3 | Explore reports and clean promotion to Build. |
-| Background supervision | No | 4 | Event-driven local supervisor and wake queue. |
-| Session restart recovery | Partial open/close | 4 | Lease and adapter reconciliation after restart. |
-| Persistent domain managers | No | 6 | Scoped Crew Leads with durable queues. |
-| Worktree isolation | Yes, Worktrunk | 3 | Preserve it behind a tested adapter contract. |
-| Several terminal backends | No | 7 | Herdr and Tmux at verified quality. |
-| Several agent harnesses | Partial | 7 | Claude and Codex verified; more through adapters. |
-| Pull-request delivery | No | 5 | GitHub delivery with checks, reviews, and approval. |
-| Local-only delivery | Manual | 5 | Revision-bound verified local merge. |
-| Unattended mode | No | 4 and 7 | Away mode, then scoped autonomous mode. |
-| Explicit safety authority | No | 5 and 7 | Profiles, policy, approvals, and receipts. |
-| Fleet overview | Basic list | 4 and 6 | Cross-project jobs, workers, leads, and alarms. |
-| Signed self-update | No | 7 | Check and explicit signed update workflow. |
+| Agent-loadable instructions | Yes | v0.2 | Keep `SKILL.md` as the trigger and protocol guide. |
+| Durable completion events | Yes, Bash JSONL | v0.2 and v0.4 | Preserve at-least-once event behavior in the transactional SQLite stream. |
+| Safe multi-repository state | No | v0.3 to v0.5 | Project registry and project-scoped names. |
+| Stable machine protocol | No | v0.4 | Versioned JSON CLI and socket API implemented by Go. |
+| Durable backlog/jobs | No | v0.5 | Jobs, runs, dependencies, briefs, and artifacts. |
+| Implementation workflow | Basic spawn | v0.5 to v0.7 | Build jobs with verification and delivery. |
+| Investigation workflow | No | v0.5 | Explore reports and clean promotion to Build. |
+| Background supervision | No | v0.6 | Event-driven local supervisor and wake queue. |
+| Session restart recovery | Partial open/close | v0.6 | Lease and adapter reconciliation after restart. |
+| Persistent domain managers | No | v0.8 | Scoped Crew Leads with durable queues. |
+| Worktree isolation | Yes, Worktrunk | v0.5 | Preserve it behind a tested adapter contract. |
+| Same-user worker isolation | No | v0.5 and v0.9 | Verified sandbox denial of control and state paths, with honest unsafe fallback. |
+| Several terminal backends | No | v0.9 | Herdr and Tmux at verified quality. |
+| Several agent harnesses | Partial | v0.9 | Claude and Codex verified; more through adapters. |
+| Pull-request delivery | No | v0.7 | GitHub delivery with checks, reviews, and approval. |
+| Local-only delivery | Manual | v0.7 | Revision-bound verified local merge. |
+| Unattended mode | No | v0.6 and v0.9 | Away mode, then scoped autonomous mode. |
+| Explicit safety authority | No | v0.5 to v0.9 | Isolation, profiles, policy, approvals, and receipts. |
+| Fleet overview | Basic list | v0.6 and v0.8 | Cross-project jobs, workers, leads, and alarms. |
+| Signed self-update | No | v0.9 | Verify pinned Sigstore identity, checksums, and macOS notarization. |
 | Public/social intake | No | After 1.0 | Connector SDK without tying the core to one network. |
 | Hosted/remote workers | No | After 1.0 | Remote cells and optional control plane. |
 
@@ -1562,8 +1620,9 @@ Release candidates must pass this reproducible scenario on a clean machine:
 13. Remove one worker endpoint during active work and reconcile it without false success.
 14. Change a branch after verification and prove that delivery is invalidated.
 15. Attempt an unapproved merge and destructive cleanup and prove both are refused.
-16. Restart the terminal backend and recover owned endpoints where the adapter supports it.
-17. Finish all work and prove safe cleanup of owned worktrees, endpoints, leases, and capabilities.
+16. Run a same-user worker probe that attempts to open the control socket, state database, operator credentials, and another run; every safe profile must deny it.
+17. Restart the terminal backend and recover owned endpoints where the adapter supports it.
+18. Finish all work and prove safe cleanup of owned worktrees, endpoints, leases, and capabilities.
 
 Pass conditions:
 
@@ -1572,6 +1631,7 @@ Pass conditions:
 - all delivery evidence points to exact revisions;
 - primary checkouts remain untouched by worker runs;
 - no unsafe action occurs without a valid approval;
+- every claimed safe profile has recorded `worker_isolation=enforced` evidence;
 - idle supervision makes zero model calls;
 - the final fleet report explains every job outcome and remaining resource.
 
@@ -1589,7 +1649,7 @@ Pass conditions:
 
 **Integration tests** create temporary Git repositories and exercise complete worktree, run, check, and delivery sagas.
 
-**Migration tests** import fixtures from the current main registry and Phase 1 event format, including corrupt and ambiguous cases.
+**Migration tests** import fixtures from the current main registry and merged PR #2 event format, including corrupt and ambiguous cases.
 
 **Fault-injection tests** stop processes, delay responses, duplicate calls, move branches, remove panes, lock files, and interrupt external operations at each recorded step.
 
@@ -1681,6 +1741,12 @@ Metrics are available locally through `crewboss status --json` and a disabled-by
 
 **Decision:** Target macOS and Linux for 1.0. Keep the API transport boundary replaceable so named pipes can be added later.
 
+### 31.8 Same-user processes do not have separate OS identities
+
+**Risk:** Unix peer credentials authenticate a user ID, not an agent role. Without a sandbox, a hostile worker running under the operator's UID can reach user-owned files, copy credentials, open SQLite directly, or call the control socket as the same user.
+
+**Decision:** Role-isolation claims require a live-tested harness sandbox that denies control, state, configuration, credential, and unrelated run paths. Workers receive only a per-run event ingress. Safe profiles fail closed without this capability. `unsafe-host` remains available through explicit expiring approval, but its policy is not described as a security boundary against hostile same-UID code.
+
 ## 32. Post-1.0 differentiators
 
 After core parity, CrewBoss can move beyond a local competitor in these directions:
@@ -1714,4 +1780,4 @@ CrewBoss is a credible Firstmate competitor when all of the following are true:
 - The required parity scenario passes on a clean supported machine.
 - The product keeps its own CrewBoss identity and leaves room for the post-1.0 differentiators.
 
-This document is the master product and architecture specification. Before implementing a phase, create a smaller execution plan that names the exact files, tests, migration steps, and commits for that phase. A phase may refine internal details, but it must not weaken the public contracts or acceptance gates here without an explicit design update.
+This document is the master product and architecture specification. Before implementing a release, create a smaller execution plan that names the exact files, tests, migration steps, and commits for that release. A release may refine internal details, but it must not weaken the public contracts or acceptance gates here without an explicit design update.
