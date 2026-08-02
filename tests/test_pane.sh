@@ -24,10 +24,19 @@ herdr() {
         printf '{"result":{"agent":{"pane_id":"w1:p9"}}}\n' ;;
       missing)
         printf '{"error":{"code":"agent_not_found"}}\n'; return 1 ;;
+      multiple_missing)
+        printf '{"result":{"agent":{"pane_id":"w1:p1"}}}\n'
+        printf '{"error":{"code":"agent_not_found"}}\n'
+        return 1
+        ;;
+      stale)
+        printf '{"error":{"code":"agent_not_found_stale"}}\n'; return 1 ;;
       broken)
         printf '{"error":{"code":"daemon_unavailable"}}\n'; return 1 ;;
       malformed)
         printf 'not-json\n' ;;
+      malformed_success)
+        printf '{"result":{"agent":{}}}\n' ;;
     esac
     return
   fi
@@ -76,6 +85,30 @@ test_missing_agent_keeps_pane() {
 
   assert_eq '' "$(cat "$HERDR_LOG")"
   assert_eq 0 "$status"
+}
+
+test_multiple_error_documents_refuse_close() {
+  HERDR_MODE=multiple_missing
+  : > "$HERDR_LOG"
+
+  local status
+  cb_pane_close w1:p1 crew-a >/dev/null 2>&1
+  status=$?
+
+  assert_eq 1 "$status" || return 1
+  assert_eq '' "$(cat "$HERDR_LOG")"
+}
+
+test_stale_missing_code_refuses_close() {
+  HERDR_MODE=stale
+  : > "$HERDR_LOG"
+
+  local status
+  cb_pane_close w1:p1 crew-a >/dev/null 2>&1
+  status=$?
+
+  assert_eq 1 "$status" || return 1
+  assert_eq '' "$(cat "$HERDR_LOG")"
 }
 
 test_daemon_error_refuses_close() {
@@ -127,11 +160,34 @@ test_public_name_remains_the_pane_label() {
     "$(cat "$HERDR_LOG")"
 }
 
+test_pane_status_reconciles_structured_responses_without_guessing() {
+  local mode expected actual
+
+  for mode in matching missing stale broken malformed_success mismatch; do
+    case $mode in
+      matching) expected=open ;;
+      missing) expected=closed ;;
+      *) expected=unknown ;;
+    esac
+    HERDR_MODE=$mode
+
+    actual=$(cb_pane_status w1:p1 crew-a) || return 1
+
+    assert_eq "$expected" "$actual" || return 1
+  done
+}
+
 run_test "closes a pane owned by the crew" test_matching_pane_closes
 run_test "refuses to close a reassigned pane" test_mismatched_pane_refuses_close
 run_test "leaves a pane alone when its agent is missing" test_missing_agent_keeps_pane
+run_test "refuses to close when Herdr returns multiple error documents" \
+  test_multiple_error_documents_refuse_close
+run_test "refuses to close for a stale missing-agent code" \
+  test_stale_missing_code_refuses_close
 run_test "refuses to close when herdr is unavailable" test_daemon_error_refuses_close
 run_test "refuses to close when herdr returns malformed JSON" test_malformed_json_refuses_close
 run_test "maps the public crew name for agent identity checks" test_public_name_maps_for_agent_identity_check
 run_test "keeps the public crew name as the pane label" test_public_name_remains_the_pane_label
+run_test "reports exact endpoint truth from structured responses" \
+  test_pane_status_reconciles_structured_responses_without_guessing
 finish_tests

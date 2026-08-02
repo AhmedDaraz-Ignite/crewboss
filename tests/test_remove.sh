@@ -53,6 +53,39 @@ write_registry() {
   }' > "$TEST_STATE/crew.json"
 }
 
+write_phase1_registry() {
+  jq -n --arg path "$TEST_REPO" '{
+    crew: {
+      branch: "feature",
+      path: $path,
+      pane: "w1:p1",
+      agent: "claude",
+      placement: "tab",
+      token: "old-token",
+      status: "open",
+      endpoint_state: "open",
+      task: "initial task",
+      latest_prompt: "follow-up",
+      crew_id: "crew-a",
+      run_id: "run-a",
+      task_status: "blocked",
+      blocked: true,
+      message: "question",
+      last_event_seq: 1
+    }
+  }' > "$TEST_STATE/crew.json"
+}
+
+write_phase1_events() {
+  cat > "$TEST_STATE/events.jsonl" <<'EVENTS'
+{"version":1,"seq":1,"event_id":"event-1","crew":"crew","crew_id":"crew-a","run_id":"run-a","kind":"blocked","payload":"question","time":"2026-07-31T12:00:01Z"}
+{"version":1,"seq":2,"event_id":"event-2","crew":"other","crew_id":"crew-b","run_id":"run-b","kind":"done","payload":"other result","time":"2026-07-31T12:00:02Z"}
+EVENTS
+  cat > "$TEST_STATE/event-state.json" <<'STATE'
+{"cursor":2,"pending":{"crew-a":{"version":1,"seq":1,"event_id":"event-1","crew":"crew","crew_id":"crew-a","run_id":"run-a","kind":"blocked","payload":"question","time":"2026-07-31T12:00:01Z"},"crew-b":{"version":1,"seq":2,"event_id":"event-2","crew":"other","crew_id":"crew-b","run_id":"run-b","kind":"done","payload":"other result","time":"2026-07-31T12:00:02Z"}}}
+STATE
+}
+
 write_fake_tools() {
   cat > "$TEST_BIN/herdr" <<'HERDR'
 #!/bin/bash
@@ -82,6 +115,15 @@ if [ "$1 $2" = "pane close" ]; then
   exit 0
 fi
 
+if [ "$1 $2" = "tab create" ]; then
+  printf '{"result":{"root_pane":{"pane_id":"w2:p2"}}}\n'
+  exit 0
+fi
+
+if [ "$1 $2" = "agent start" ]; then
+  exit 0
+fi
+
 exit 2
 HERDR
 
@@ -101,15 +143,20 @@ setup_remove_fixture() {
 }
 
 run_remove() {
+  run_crewboss remove "$@"
+}
+
+run_crewboss() {
   PATH="$TEST_BIN:$PATH" \
     CB_STATE_DIR="$TEST_STATE" \
     CB_BASE=origin/main \
+    HERDR_WORKSPACE_ID=w1 \
     TEST_LOG="$TEST_LOG" \
     TEST_REPO="$TEST_REPO" \
     WT_EXIT="${WT_EXIT:-0}" \
     HERDR_MODE="${HERDR_MODE:-matching}" \
     HERDR_DIRTY_ON_CLOSE="${HERDR_DIRTY_ON_CLOSE:-0}" \
-    "$PROJECT_ROOT/scripts/crewboss" remove "$@"
+    "$PROJECT_ROOT/scripts/crewboss" "$@"
 }
 
 test_dirty_worktree_refuses_before_external_calls() {
@@ -225,6 +272,70 @@ test_worktrunk_failure_keeps_closed_registry() {
   assert_eq closed "$(jq -r '.crew.status' "$TEST_STATE/crew.json")" || return 1
 }
 
+test_close_and_open_preserve_phase1_state_and_event_files() {
+  setup_remove_fixture
+  write_phase1_registry
+  write_phase1_events
+  local before output status
+  before=$(jq -c '.crew | del(.status, .endpoint_state, .pane)' "$TEST_STATE/crew.json") || return 1
+  cp "$TEST_STATE/events.jsonl" "$TEST_TMP/events.before" || return 1
+  cp "$TEST_STATE/event-state.json" "$TEST_TMP/event-state.before" || return 1
+
+  output=$(run_crewboss close crew 2>&1)
+  status=$?
+  assert_eq 0 "$status" || return 1
+  assert_contains "$output" "closed crew" || return 1
+  jq -e '.crew.status == "closed" and .crew.endpoint_state == "closed"' \
+    "$TEST_STATE/crew.json" >/dev/null || return 1
+
+  output=$(run_crewboss open crew 2>&1)
+  status=$?
+  assert_eq 0 "$status" || return 1
+  assert_contains "$output" "reopened crew" || return 1
+  jq -e '.crew.status == "open" and .crew.endpoint_state == "open"' \
+    "$TEST_STATE/crew.json" >/dev/null || return 1
+  assert_eq w2:p2 "$(jq -r '.crew.pane' "$TEST_STATE/crew.json")" || return 1
+  assert_eq "$before" \
+    "$(jq -c '.crew | del(.status, .endpoint_state, .pane)' "$TEST_STATE/crew.json")" || return 1
+  cmp -s "$TEST_TMP/events.before" "$TEST_STATE/events.jsonl" || return 1
+  cmp -s "$TEST_TMP/event-state.before" "$TEST_STATE/event-state.json"
+}
+
+test_successful_remove_drops_only_its_pending_projection() {
+  setup_remove_fixture
+  write_phase1_registry
+  write_phase1_events
+  commit_feature
+  push_feature
+  cp "$TEST_STATE/events.jsonl" "$TEST_TMP/events.before" || return 1
+
+  run_remove crew >/dev/null 2>&1 || return 1
+
+  cmp -s "$TEST_TMP/events.before" "$TEST_STATE/events.jsonl" || return 1
+  jq -e '.cursor == 2 and (.pending | keys) == ["crew-b"] and
+    .pending["crew-b"].event_id == "event-2"' \
+    "$TEST_STATE/event-state.json" >/dev/null || return 1
+  jq -e 'has("crew") | not' "$TEST_STATE/crew.json" >/dev/null
+}
+
+test_failed_remove_keeps_pending_projection_and_raw_log() {
+  setup_remove_fixture
+  write_phase1_registry
+  write_phase1_events
+  commit_feature
+  push_feature
+  WT_EXIT=7
+  cp "$TEST_STATE/events.jsonl" "$TEST_TMP/events.before" || return 1
+  cp "$TEST_STATE/event-state.json" "$TEST_TMP/event-state.before" || return 1
+
+  ! run_remove crew >/dev/null 2>&1 || return 1
+
+  cmp -s "$TEST_TMP/events.before" "$TEST_STATE/events.jsonl" || return 1
+  cmp -s "$TEST_TMP/event-state.before" "$TEST_STATE/event-state.json" || return 1
+  jq -e '.crew.status == "closed" and .crew.crew_id == "crew-a"' \
+    "$TEST_STATE/crew.json" >/dev/null
+}
+
 test_missing_agent_skips_pane_close_and_removes() {
   setup_remove_fixture
   commit_feature
@@ -267,6 +378,12 @@ run_test "invalid force argument fails before external calls" test_invalid_force
 run_test "extra removal argument fails before external calls" test_extra_argument_fails_before_external_calls
 run_test "pane mismatch keeps the open registry and worktree" test_pane_mismatch_keeps_open_registry_and_worktree
 run_test "worktrunk failure keeps a recoverable closed registry" test_worktrunk_failure_keeps_closed_registry
+run_test "close and open preserve phase-one task and event state" \
+  test_close_and_open_preserve_phase1_state_and_event_files
+run_test "successful removal drops only its pending event projection" \
+  test_successful_remove_drops_only_its_pending_projection
+run_test "failed removal preserves its pending event projection and raw log" \
+  test_failed_remove_keeps_pending_projection_and_raw_log
 run_test "missing agent skips pane close and removes the worktree" test_missing_agent_skips_pane_close_and_removes
 run_test "change during pane close keeps a recoverable closed crew" test_change_during_close_keeps_closed_registry_and_worktree
 finish_tests

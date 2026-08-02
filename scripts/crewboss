@@ -13,15 +13,17 @@ CB_HOME=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CB_HOME/lib/agent.sh"
 # shellcheck source=scripts/lib/registry.sh
 . "$CB_HOME/lib/registry.sh"
+# shellcheck source=scripts/lib/events.sh
+. "$CB_HOME/lib/events.sh"
 
 usage() {
   cat <<'EOF'
 crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herdr
 
   crewboss spawn <task...>   [--in tab|space|split] [--agent KIND] [--branch NAME]
-  crewboss list
+  crewboss list                   print NAME ENDPOINT TASK BRANCH SUMMARY
   crewboss send  <name> <text...>
-  crewboss wait  <name>            block (zero tokens) until the crew reports done, then print its reply
+  crewboss wait  <name>...         print the oldest current event for the selected crews
   crewboss read  <name> [lines]
   crewboss focus <name>            jump herdr to that crew's pane
   crewboss close <name>            close the pane; worktree and conversation are kept
@@ -30,6 +32,17 @@ crewboss - spawn agent sessions on tasks, in isolated worktrees, visible in herd
 
 remove refuses dirty or locally unpushed work. -f is explicit discard authority.
 crewboss verifies the live pane before closing it and never spawns in the primary checkout.
+
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are blocked and done. FIFO means the oldest inserted event first. In Phase 1, wait
+is the foreground listener. It has no task timeout or background watcher, and it does not poll
+screens. It returns the oldest current event for the selected crews.
+
+The first output line is "NAME blocked" or "NAME done". The exact payload follows.
+The payload can use more than one line.
+An event can appear again after a crash, but an appended event is not lost.
+ENDPOINT is open, closed, or unknown. TASK is running, blocked, done, or unknown.
+SUMMARY uses the stored initial task. crew.json also stores the latest prompt.
 
 The branch is derived from the task text: a Jira-style ticket key plus the first words become
 <prefix>-ABC-123-short-description. No ticket means <prefix>-<slug>. --branch overrides.
@@ -60,15 +73,29 @@ do_spawn() {
   name=$(cb_name "$task")
   cb_reg_get "$name" >/dev/null 2>&1 && die "crew '$name' already exists (send, open, or remove it)"
 
-  local tree pane token
+  local tree pane crew_id run_id failure_status
   tree=$(cb_tree_create "$branch") || die "worktree creation failed for $branch"
   pane=$(cb_pane_create "$placement" "$tree" "$name") || die "could not create a herdr pane"
   cb_agent_start "$name" "$kind" "$pane" fresh || die "agent failed to start"
-  token=$(cb_agent_prompt "$name" "$task") || die "could not send the task"
-
-  cb_reg_put "$name" "$(jq -n --arg b "$branch" --arg p "$tree" --arg pane "$pane" \
-    --arg k "$kind" --arg pl "$placement" --arg t "$token" \
-    '{branch: $b, path: $p, pane: $pane, agent: $k, placement: $pl, token: $t, status: "open"}')"
+  crew_id=$(cb_id_new crew) || die "could not create crew identity"
+  run_id=$(cb_id_new run) || die "could not create run identity"
+  cb_reg_replace "$name" "$(jq -n --arg b "$branch" --arg p "$tree" --arg pane "$pane" \
+    --arg k "$kind" --arg pl "$placement" --arg task "$task" \
+    --arg crew_id "$crew_id" --arg run_id "$run_id" '
+      {branch: $b, path: $p, pane: $pane, agent: $k, placement: $pl,
+       status: "open", endpoint_state: "open", task: $task, latest_prompt: $task,
+       crew_id: $crew_id, run_id: $run_id, task_status: "running",
+       blocked: false, message: "", last_event_seq: 0}
+    ')" || die "could not save crew state"
+  if ! cb_agent_prompt "$name" "$task" "$crew_id" "$run_id" \
+    "$CB_HOME/crewboss" "$CB_STATE_DIR" "$pane"; then
+    cb_reg_mark_prompt_unknown "$name" "$crew_id" "$run_id" 0
+    failure_status=$?
+    case $failure_status in
+      0|2) die "could not send the task" ;;
+      *) die "could not send the task and could not update crew state" ;;
+    esac
+  fi
 
   echo "spawned $name  branch=$branch  pane=$pane"
   echo "watch it in herdr, or: crewboss wait $name"
@@ -76,15 +103,58 @@ do_spawn() {
 
 do_list() {
   cb_reg_init
-  local n state
-  printf '%-20s %-8s %-45s %s\n' NAME STATE BRANCH PANE
+  cb_event_pump || die "could not read crew events"
+  local n record lifecycle pane crew_id endpoint reconcile_status
   for n in $(cb_reg_names); do
-    if [ "$(cb_reg_field "$n" status)" = closed ]; then
-      state=closed
+    record=$(cb_reg_get "$n") || die "could not read crew '$n'"
+    lifecycle=$(jq -r '.status // empty' <<< "$record") || die "could not read crew '$n'"
+    [ "$lifecycle" = open ] || continue
+    pane=$(jq -r '.pane // empty' <<< "$record") || die "could not read crew '$n'"
+    crew_id=$(jq -r '
+      if ((.crew_id? | type) == "string" and (.crew_id | length) > 0)
+      then .crew_id else "" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    if [ -n "$pane" ]; then
+      endpoint=$(cb_pane_status "$pane" "$n") || die "could not inspect crew '$n'"
     else
-      state=$(cb_agent_state "$n"); state=${state:-unknown}
+      endpoint=unknown
     fi
-    printf '%-20s %-8s %-45s %s\n' "$n" "$state" "$(cb_reg_field "$n" branch)" "$(cb_reg_field "$n" pane)"
+    cb_reg_reconcile_endpoint "$n" "$pane" "$endpoint" "$crew_id"
+    reconcile_status=$?
+    case $reconcile_status in
+      0|2) ;;
+      *) die "could not update crew '$n'" ;;
+    esac
+  done
+
+  local task_state branch summary
+  printf '%-20s %-9s %-9s %-45s %s\n' NAME ENDPOINT TASK BRANCH SUMMARY
+  for n in $(cb_reg_names); do
+    record=$(cb_reg_get "$n") || die "could not read crew '$n'"
+    endpoint=$(jq -r '
+      if (.endpoint_state == "open" or .endpoint_state == "closed" or
+          .endpoint_state == "unknown") then .endpoint_state else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    task_state=$(jq -r '
+      if (.task_status == "running" or .task_status == "blocked" or
+          .task_status == "done" or .task_status == "unknown")
+      then .task_status else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    branch=$(jq -r '
+      if ((.branch? | type) == "string" and (.branch | length) > 0)
+      then .branch else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    summary=$(jq -r '
+      if ((.task? | type) == "string" and (.task | length) > 0) then
+        .task | gsub("[\\r\\n\\t]+"; " ") | gsub(" +"; " ") |
+        sub("^ +"; "") | sub(" +$"; "") |
+        if length == 0 then "unknown"
+        elif length > 60 then .[0:57] + "..."
+        else . end
+      else "unknown" end
+    ' <<< "$record") || die "could not read crew '$n'"
+    printf '%-20s %-9s %-9s %-45s %s\n' \
+      "$n" "$endpoint" "$task_state" "$branch" "$summary"
   done
 }
 
@@ -93,23 +163,46 @@ do_send() {
   require_crew "$name"
   [ "$(cb_reg_field "$name" status)" = open ] || die "'$name' is closed (crewboss open $name)"
   [ $# -gt 0 ] || die "send needs text"
-  local token
-  token=$(cb_agent_prompt "$name" "$*") || die "could not send"
-  cb_reg_put "$name" "$(jq -n --arg t "$token" '{token: $t}')"
+  local prompt=$* candidate_crew_id crew_id run_id receipt pane finish_status
+  candidate_crew_id=$(cb_id_new crew) || die "could not create crew identity"
+  run_id=$(cb_id_new run) || die "could not create run identity"
+  cb_reg_send_begin "$name" "$candidate_crew_id" "$run_id" "$prompt" ||
+    die "could not prepare the crew state"
+  receipt=$CB_REG_SEND_RECEIPT
+  crew_id=$(jq -r '.crew_id' <<< "$receipt") || die "could not read the crew identity"
+  pane=$(jq -r '
+    if ((.prepared.pane? | type) == "string") then .prepared.pane else "" end
+  ' <<< "$receipt") || pane=
+
+  if cb_agent_prompt "$name" "$prompt" "$crew_id" "$run_id" \
+    "$CB_HOME/crewboss" "$CB_STATE_DIR" "$pane"; then
+    cb_reg_send_finish "$name" "$receipt" success ||
+      die "task was sent but the crew state changed before delivery finished"
+  else
+    cb_reg_send_finish "$name" "$receipt" failure
+    finish_status=$?
+    case $finish_status in
+      0) die "could not confirm prompt delivery" ;;
+      2) die "could not confirm prompt delivery; crew state changed while delivery was in progress" ;;
+      *) die "could not confirm prompt delivery and could not update crew state" ;;
+    esac
+  fi
   echo "sent; crewboss wait $name"
 }
 
 do_wait() {
-  local name=$1 pane token
-  require_crew "$name"
-  pane=$(cb_reg_field "$name" pane)
-  token=$(cb_reg_field "$name" token)
-  [ -n "$token" ] || die "nothing pending for '$name' (spawn or send first)"
-  if ! cb_agent_wait "$pane" "$token"; then
-    die "'$name' has not finished (state: $(cb_agent_state "$name")); wait again or crewboss read $name"
-  fi
-  cb_reg_put "$name" '{"token": ""}'
-  cb_agent_read "$name"
+  local name event crew kind
+  for name in "$@"; do
+    require_crew "$name"
+  done
+  event=$(cb_event_next "$@") || die "could not read crew events"
+  crew=$(jq -r '.crew' <<< "$event") || die "could not read crew event"
+  kind=$(jq -r '.kind' <<< "$event") || die "could not read crew event"
+
+  printf '%s %s\n' "$crew" "$kind" || return 1
+  jq -r '.payload' <<< "$event" || return 1
+  cb_event_ack "$event" ||
+    die "event was printed but could not be acknowledged; wait may print it again"
 }
 
 do_read() {
@@ -129,7 +222,7 @@ close_crew() {
   local name=$1
   cb_pane_close "$(cb_reg_field "$name" pane)" "$name" ||
     die "could not safely close '$name'"
-  cb_reg_put "$name" '{"status": "closed", "token": ""}' ||
+  cb_reg_put "$name" '{"status": "closed", "endpoint_state": "closed"}' ||
     die "could not update the crew registry"
 }
 
@@ -149,7 +242,9 @@ do_open() {
   placement=$(cb_reg_field "$name" placement)
   pane=$(cb_pane_create "$placement" "$tree" "$name") || die "could not create a herdr pane"
   cb_agent_start "$name" "$kind" "$pane" resume || die "agent failed to resume"
-  cb_reg_put "$name" "$(jq -n --arg p "$pane" '{pane: $p, status: "open", token: ""}')"
+  cb_reg_put "$name" "$(jq -n --arg p "$pane" \
+    '{pane: $p, status: "open", endpoint_state: "open"}')" ||
+    die "could not update the crew registry"
   echo "reopened $name  pane=$pane (conversation resumed)"
 }
 
@@ -157,13 +252,14 @@ do_remove() {
   if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     die "usage: crewboss remove <name> [-f]"
   fi
-  local name=$1 force=${2:-} branch path
+  local name=$1 force=${2:-} branch path crew_id
   [ -z "$force" ] || [ "$force" = -f ] ||
     die "usage: crewboss remove <name> [-f]"
 
   require_crew "$name"
   branch=$(cb_reg_field "$name" branch)
   path=$(cb_reg_field "$name" path)
+  crew_id=$(cb_reg_field "$name" crew_id)
   cb_tree_check_remove "$branch" "$path" "$force" ||
     die "refusing to remove '$name'"
 
@@ -175,8 +271,16 @@ do_remove() {
     die "'$name' changed while closing; worktree kept (crewboss open $name)"
   cb_tree_remove "$branch" "$force" ||
     die "worktree removal failed; crew kept closed (crewboss open $name)"
+  if [ -n "$crew_id" ]; then
+    cb_event_drop_crew "$crew_id" ||
+      die "worktree removed but pending event cleanup failed"
+  fi
   cb_reg_del "$name" || die "worktree removed but registry cleanup failed"
   echo "removed $name"
+}
+
+do_emit() {
+  cb_event_emit "$@" || die "could not append crew event"
 }
 
 cmd=${1:-help}
@@ -185,12 +289,13 @@ case $cmd in
   spawn)  do_spawn "$@" ;;
   list)   do_list ;;
   send)   [ $# -ge 2 ] || die "usage: crewboss send <name> <text...>"; do_send "$@" ;;
-  wait)   [ $# -ge 1 ] || die "usage: crewboss wait <name>"; do_wait "$1" ;;
+  wait)   [ $# -ge 1 ] || die "usage: crewboss wait <name>..."; do_wait "$@" ;;
   read)   [ $# -ge 1 ] || die "usage: crewboss read <name> [lines]"; do_read "$@" ;;
   focus)  [ $# -ge 1 ] || die "usage: crewboss focus <name>"; do_focus "$1" ;;
   close)  [ $# -ge 1 ] || die "usage: crewboss close <name>"; do_close "$1" ;;
   open)   [ $# -ge 1 ] || die "usage: crewboss open <name>"; do_open "$1" ;;
   remove) do_remove "$@" ;;
+  emit)   [ $# -eq 5 ] || die "invalid crew event"; do_emit "$@" ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;
 esac

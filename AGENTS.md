@@ -5,7 +5,7 @@ in this repository. `CLAUDE.md` is a symlink to it.
 
 ## What this repo is
 
-crewboss is a ~550-line Bash tool published as an **agent skill**, not an application. There is no
+crewboss is a small Bash tool published as an **agent skill**, not an application. There is no
 build, no package manager, no dependency tree. The whole product is `SKILL.md` (what an agent reads)
 plus `scripts/` (what it runs). Users install it with `npx skills add AhmedDaraz-Ignite/crewboss`,
 which copies this repo into `.claude/skills/` or `.agents/skills/`.
@@ -38,50 +38,62 @@ tool immediately. Edit in this clone, never in the symlink target path.
 
 ## Architecture
 
-Five modules, one dispatcher, sourced not exec'd:
+Six modules, one dispatcher, sourced not exec'd:
 
 | File | Owns |
 | --- | --- |
-| `scripts/crewboss` | argument parsing and the `do_*` command bodies. No external tool calls of its own except `herdr agent focus` |
+| `scripts/crewboss` | argument parsing, public command flow, and output formatting |
 | `lib/naming.sh` | task text to crew name and branch name |
 | `lib/tree.sh` | worktree lifecycle, delegated to `wt` (worktrunk) |
 | `lib/pane.sh` | pane lifecycle, delegated to `herdr` |
-| `lib/agent.sh` | agent process lifecycle and the completion protocol, delegated to `herdr` |
-| `lib/registry.sh` | the only state crewboss itself owns |
+| `lib/agent.sh` | agent process and prompt lifecycle, delegated to `herdr` |
+| `lib/registry.sh` | crew records, task text, identities, and current state |
+| `lib/events.sh` | shared event append, FIFO reading, pending events, and checkpoints |
 
 The layering rule that keeps this small: **crewboss owns no worktrees and no processes.** worktrunk
-owns the worktree and its path template, herdr owns panes and agent processes. crewboss owns one JSON
-file at `$CB_STATE_DIR/crew.json` (default `~/.local/state/crewboss/`) mapping a crew name to
-`{branch, path, pane, agent, placement, token, status}`. That file is the reason `close` and `open`
-can restore a crew. It is global across repos, not per-repo.
+owns the worktree and its path template, and herdr owns panes and agent processes. CrewBoss owns
+state under `$CB_STATE_DIR` (default `~/.local/state/crewboss/`). It is global across repos, not
+per-repo:
+
+- `crew.json` stores crew records, the exact initial task, and the latest prompt.
+- `events.jsonl` is the shared append-only event source.
+- `event-state.json` stores the read cursor and pending event checkpoint.
+
+The crew record is why `close` and `open` can restore a crew.
 
 ### Interface invariant
 
-Every command takes a **crew name**. Never a pane id, never a path, never a timeout. Timeouts are
-constants inside `lib/agent.sh` (`CB_START_TIMEOUT_MS` 120s, `CB_TASK_TIMEOUT_MS` 30 min). Pane ids
-live in the registry and are looked up, never typed. Preserve this when adding commands.
+Every public command that targets a crew takes a **crew name**. Never a pane ID, path, or timeout.
+Pane IDs live in the registry and are looked up, never typed. `wait` accepts one or more crew names.
+The internal `emit` command also takes stored crew and run identities. Preserve this boundary.
 
-### The completion protocol
+### Event supervision
 
-`wait` is the load-bearing design decision. herdr 0.7.5's own `agent wait` and `prompt --wait` sample
-agent state and miss edges, so crewboss does not use them. Instead `cb_agent_prompt` appends an
-instruction to print `TASKDONE<random>` as the final line, and `cb_agent_wait` calls
-`herdr pane wait-output --regex --source recent`. One blocking call, so an agent doing the waiting
-spends zero tokens.
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are `blocked` and `done`. FIFO means the oldest inserted event first. The event append is
+the notification. CrewBoss does not use screen text as a completion signal.
 
-Two details in `cb_agent_prompt` look odd and are deliberate:
+`wait A B C` is the Phase 1 foreground listener. It returns the oldest current event for the
+selected crews. The first output line is `NAME blocked` or `NAME done`. The exact payload follows
+and can use more than one line. There is no task timeout or background watcher. It does not poll
+screens.
 
-- The token word and the digits are written apart in the prompt text ("the word TASKDONE followed
-  immediately by the digits 4231"). If they were joined, the echoed instruction in the pane would
-  itself match the regex and `wait` would return instantly.
-- After sending, it greps the pane for `digits $num` and resends up to 5 times. A freshly started
-  agent silently swallows its first prompt often enough to matter.
+Delivery is at least once after a crash. An event may be printed twice, but an appended event must
+not be lost. `events.jsonl` remains the source. `event-state.json` is only a cursor and pending
+checkpoint.
 
-`cb_agent_start` retries for 15 seconds on `agent_pane_busy` for the same class of reason: a
-brand-new pane rejects an agent start until its shell is up.
+Two observed Herdr retries are deliberate:
 
-Do not "simplify" any of these three loops. They are workarounds for observed races, not defensive
-padding.
+- `cb_agent_start` retries when a new pane reports `agent_pane_busy`.
+- `cb_agent_prompt` looks for the unique `CrewBoss run id: RUN_ID` marker. It tries prompt delivery
+  up to five times because a new agent can silently swallow its first prompt.
+
+Do not remove or shorten these retries without new runtime evidence. They work around observed
+races.
+
+`list` prints `NAME ENDPOINT TASK BRANCH SUMMARY`. Endpoint values are `open`, `closed`, and
+`unknown`. Task values are `running`, `blocked`, `done`, and `unknown`. The summary uses the stored
+initial task.
 
 ### Naming derivation
 
@@ -92,8 +104,9 @@ remote's default branch. `--branch` bypasses the whole chain.
 
 ### Reads are screen snapshots
 
-`cb_agent_read` returns the visible pane buffer (`--source recent-unwrapped`), not a transcript. Any
-code or instruction that consumes a read has to grep for what it expects rather than trust the tail.
+`cb_agent_read` returns the visible pane buffer (`--source recent-unwrapped`), not a transcript or
+notification. Any code or instruction that consumes a read has to grep for what it expects rather
+than trust the tail.
 
 ## Conventions
 

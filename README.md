@@ -1,6 +1,6 @@
 # crewboss
 
-crewboss lets one AI agent (or you) start other AI agents and give them tasks.
+crewboss lets one AI agent (or you) start other AI agents and supervise their tasks.
 
 Each helper agent is called a **crew**. Every crew gets:
 
@@ -14,14 +14,33 @@ You can close a crew and open it again later. It remembers the whole conversatio
 
 ```bash
 crewboss spawn "ABC-123 make the footer sticky"
-crewboss wait ABC-123          # waits until the crew says it is done, then prints its answer
-crewboss send ABC-123 "also fix the mobile layout"
+crewboss spawn "ABC-124 fix the login redirect"
+crewboss spawn "ABC-125 add an export button"
+crewboss wait ABC-123 ABC-124 ABC-125
+```
+
+`wait` returns the oldest current event for the selected crews. It can be `blocked` or
+`done`. The first line is the crew name and event kind. The exact payload follows and
+can use more than one line:
+
+```text
+ABC-124 blocked
+Should guests see the login page?
+```
+
+Relay the exact question to the user. Then send the answer:
+
+```bash
+crewboss send ABC-124 "Yes, guests should see it."
+crewboss wait ABC-123 ABC-124 ABC-125
 crewboss close ABC-123         # closes the window; files and conversation are kept
 crewboss open  ABC-123         # opens it again, right where it stopped
 crewboss remove ABC-123 -f     # discards local work and deletes everything for this crew
 ```
 
-That is the whole idea: `spawn` a crew, `wait` for it, `send` more work, `close` when done.
+For a `done` event, act on the final answer. For example, review the files or report the result.
+When several crews are planned, spawn them all before waiting. Then use one blocking
+`wait A B C` call. `wait A` also works for one crew.
 
 ## Install as an agent skill
 
@@ -45,9 +64,11 @@ This follows the standard agent-skills protocol, so it works the same in any age
 that supports skills:
 
 1. At the start of a session, your agent reads only the skill's one-line description.
-2. When you ask for something that matches it - "spawn a crew", "delegate this to a
-   parallel session", "work on these three tickets in parallel", or simply the word
-   "crewboss" - the agent loads the full `SKILL.md` and runs the bundled script.
+2. When you ask to "spawn a crew", "delegate a task to a parallel agent session",
+   "work on several tasks in parallel", or "orchestrate work across worktrees", the
+   agent loads the full `SKILL.md`. The same happens when you ask to
+   "wait for blocked or done crew events" or say "crewboss". The agent then runs the
+   bundled script.
 3. Normal tasks ("fix the footer") still run in the current session. Nothing is
    delegated unless you ask for it.
 
@@ -99,32 +120,55 @@ Two settings you can change:
 
 ## How it works inside
 
-crewboss is a small bash script plus five modules. Each module does one job:
+crewboss is a small bash script plus six modules. Each module does one job:
 
 | Module            | Job                                                     |
 | ----------------- | ------------------------------------------------------- |
 | `lib/naming.sh`   | turns task text into a crew name and a branch name      |
 | `lib/tree.sh`     | creates and removes worktrees (using worktrunk)         |
 | `lib/pane.sh`     | opens, focuses, and closes windows (using herdr)        |
-| `lib/agent.sh`    | starts the agent, sends the task, waits for the answer  |
-| `lib/registry.sh` | remembers each crew, so close and open work later       |
+| `lib/agent.sh`    | starts the agent, sends prompts, and reads its screen    |
+| `lib/registry.sh` | remembers each crew and its current task state           |
+| `lib/events.sh`   | appends and reads crew events                            |
 
-**How `wait` knows the crew is done:** crewboss adds one line to every task, asking
-the crew to print a secret code word when it finishes. Then it asks herdr to watch
-the crew's window for that code word. This is one single blocking call. So if an AI
-agent is the one waiting, it spends zero tokens during the wait - it does not need
-to check again and again.
+Crews append events to one shared append-only log; CrewBoss reads them in strict FIFO insertion order and acts.
+The events are `blocked` and `done`. FIFO means the oldest inserted event first.
+`wait NAME...` returns the oldest current event for the selected crews. Events for other
+crews stay pending.
+
+In Phase 1, `wait` is the foreground listener. It has no task timeout or background
+watcher. It blocks in one shell process and does not poll crew screens. `read` only
+returns a screen snapshot. Screen text is not a notification.
+
+Event delivery is at least once after a crash. This means an event can be printed
+again, but an appended event is not lost.
 
 **How `open` brings a conversation back:** the worktree keeps the files, and the
 agent saves its chat history per folder. So starting the agent again in the same
 folder (`claude --continue`) brings the old conversation back.
 
-crewboss also protects you from two timing bugs we hit while building it: a brand
-new window can refuse to start an agent for a few seconds (crewboss retries), and a
-brand new agent can lose the first message you send it (crewboss checks the message
-arrived and sends it again if not).
+crewboss also protects you from two timing bugs we hit while building it. A new pane
+can report `agent_pane_busy`, so CrewBoss retries the agent start. A new agent can lose
+its first prompt, so CrewBoss checks for the unique CrewBoss run ID and tries prompt
+delivery up to five times.
 
-Crew records live in `~/.local/state/crewboss/crew.json`.
+State lives under `$CB_STATE_DIR`. Its default is `~/.local/state/crewboss/`:
+
+| File | Contents |
+| --- | --- |
+| `crew.json` | crew records, the exact initial task, and the latest prompt |
+| `events.jsonl` | the shared append-only event source |
+| `event-state.json` | the read cursor and pending event checkpoint |
+
+`crewboss list` prints these exact columns:
+
+```text
+NAME ENDPOINT TASK BRANCH SUMMARY
+```
+
+`ENDPOINT` is `open`, `closed`, or `unknown`. `TASK` is `running`, `blocked`, `done`,
+or `unknown`. `SUMMARY` comes from the stored initial task. The exact initial task and
+latest prompt remain in `crew.json`.
 
 ## Safe cleanup
 

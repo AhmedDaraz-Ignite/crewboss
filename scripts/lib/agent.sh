@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# agent: start, prompt, wait, read. All timeouts are internal - the interface never asks for one.
+# agent: start, prompt, and read. All timeouts are internal - the interface never asks for one.
 CB_START_TIMEOUT_MS=120000   # startup readiness budget passed to herdr agent start
-CB_TASK_TIMEOUT_MS=1800000   # how long `crewboss wait` blocks for one task (30 min)
+CB_PROMPT_CONFIRM_TIMEOUT_MS=4000  # each prompt receipt budget passed to pane wait-output
 
 # Per-agent extra args. resume must restore the previous conversation in the same worktree.
 cb_agent_args() {
@@ -30,33 +30,68 @@ cb_agent_start() {
   done
 }
 
-# Sends the task plus a completion sentinel. The token word and digits are split in the prompt
-# text so the echoed instruction cannot match the joined regex that wait looks for.
 # A freshly started agent can silently swallow the first prompt, so confirm the text
 # actually echoed in the pane and resend if it did not.
-cb_agent_prompt() {
-  local name=$1 task=$2 tok=TASKDONE num=$RANDOM target tries=0
-  target=$(cb_agent_target "$name") || return 1
-  while :; do
-    herdr agent prompt "$target" "$task
+_cb_agent_shell_quote() {
+  printf '%q' "$1"
+}
 
-When you are completely finished, print on its own final line the word $tok followed immediately by the digits $num, with no space between them." >/dev/null || return 1
-    sleep 2
-    if herdr agent read "$target" --source recent-unwrapped --lines 120 2>/dev/null \
-        | grep -q "digits $num"; then
-      printf '%s%s' "$tok" "$num"
+cb_agent_prompt() {
+  local name=$1 task=$2 crew_id=$3 run_id=$4 tool_path=$5 state_dir=$6
+  local pane=$7 target tries=0 marker prompt q_name q_crew_id q_run_id q_tool q_state
+  local payload_nonce payload_suffix blocked_delimiter done_delimiter
+  target=$(cb_agent_target "$name") || return 1
+  marker="CrewBoss run id: $run_id"
+  payload_nonce="${RANDOM}_${RANDOM}_${RANDOM}"
+  payload_suffix="CREWBOSS_PAYLOAD_SUFFIX_$payload_nonce"
+  blocked_delimiter="CREWBOSS_BLOCKED_PAYLOAD_$payload_nonce"
+  done_delimiter="CREWBOSS_DONE_PAYLOAD_$payload_nonce"
+  [ -n "$pane" ] || return 1
+  q_name=$(_cb_agent_shell_quote "$name") || return 1
+  q_crew_id=$(_cb_agent_shell_quote "$crew_id") || return 1
+  q_run_id=$(_cb_agent_shell_quote "$run_id") || return 1
+  q_tool=$(_cb_agent_shell_quote "$tool_path") || return 1
+  q_state=$(_cb_agent_shell_quote "$state_dir") || return 1
+  prompt="$task
+
+Use CrewBoss events to report this run. Put the exact message between the opening and closing delimiter. Keep the single quotes around the opening delimiter so shell syntax in the message stays inert. If the message contains the closing delimiter on a line by itself, append _X to both delimiter occurrences. Leave the suffix and cleanup lines unchanged; they preserve intentional trailing newlines.
+
+When you need an answer, emit the exact question before waiting:
+CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'$blocked_delimiter'
+the exact question
+$blocked_delimiter
+printf '%s' '$payload_suffix'
+)\"
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%$payload_suffix}
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%\$'\\n'}
+CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id blocked \"\$CREWBOSS_EVENT_PAYLOAD\"
+unset CREWBOSS_EVENT_PAYLOAD
+
+When the work is complete, emit the final answer before ending:
+CREWBOSS_EVENT_PAYLOAD=\"\$(cat <<'$done_delimiter'
+the final answer
+$done_delimiter
+printf '%s' '$payload_suffix'
+)\"
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%$payload_suffix}
+CREWBOSS_EVENT_PAYLOAD=\${CREWBOSS_EVENT_PAYLOAD%\$'\\n'}
+CB_STATE_DIR=$q_state $q_tool emit $q_name $q_crew_id $q_run_id done \"\$CREWBOSS_EVENT_PAYLOAD\"
+unset CREWBOSS_EVENT_PAYLOAD
+
+$marker"
+
+  while :; do
+    herdr agent prompt "$target" "$prompt" >/dev/null || return 1
+    if herdr pane wait-output "$pane" --match "$marker" \
+        --source recent-unwrapped --timeout "$CB_PROMPT_CONFIRM_TIMEOUT_MS" \
+        >/dev/null 2>&1; then
       return 0
     fi
     if [ $((tries += 1)) -ge 5 ]; then
       echo "crewboss: prompt never appeared in $name's pane" >&2
       return 1
     fi
-    sleep 2
   done
-}
-
-cb_agent_wait() {
-  herdr pane wait-output "$1" --regex "$2" --source recent --timeout "$CB_TASK_TIMEOUT_MS" >/dev/null
 }
 
 # A read is a screen snapshot, not a transcript - read generously.
