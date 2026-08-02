@@ -395,9 +395,9 @@ Fields: `id`, `slug`, `display_name`, `config_revision`, `created_at`, `updated_
 
 #### `projects`
 
-Fields: `id`, `slug`, `display_name`, `repo_root`, `repo_identity`, `canonical_remote`, `base_branch`, `session_adapter`, `worktree_adapter`, `harness_defaults_json`, `forge_config_json`, `status`, `generation`, `created_at`, `updated_at`, `archived_at`.
+Fields: `id`, `slug`, `display_name`, `repo_root`, `repo_identity`, `canonical_remote`, `base_branch`, `branch_prefix`, `session_adapter`, `worktree_adapter`, `harness_defaults_json`, `forge_config_json`, `verification_json`, `policy_json`, `status`, `generation`, `created_at`, `updated_at`, `archived_at`.
 
-`slug` and `repo_identity` are unique for active projects. `repo_identity` is derived from the canonical repository identity, not only the current path.
+`slug` and `repo_identity` are unique for active projects. `repo_identity` is derived from the canonical repository identity, not only the current path. `branch_prefix`, `verification_json`, and `policy_json` hold the project-owned settings that sections 15.3 and 18.1 require; they are explicit columns, not values hidden inside another JSON field.
 
 #### `boss_sessions`
 
@@ -451,9 +451,15 @@ Partial unique indexes allow only one open decision for each `(run_id, key)` whe
 
 #### `approvals`
 
-Fields: `id`, `job_id`, `action`, `target_json`, `scope_json`, `requested_by`, `approved_by`, `denied_by`, `method`, `state`, `receipt_hash`, `generation`, `created_at`, `approved_at`, `denied_at`, `expires_at`, `consumed_at`.
+Fields: `id`, `job_id`, `grant_id`, `action`, `target_json`, `scope_json`, `requested_by`, `approved_by`, `denied_by`, `method`, `state`, `receipt_hash`, `generation`, `created_at`, `approved_at`, `denied_at`, `expires_at`, `consumed_at`.
 
-An approval is bound to one described action and cannot be widened after creation.
+An approval is bound to one described action and cannot be widened after creation. Every approval is single-use; consumption follows 13.6. `grant_id` is null for a direct operator approval and set when the approval was minted by consuming a grant.
+
+#### `grants`
+
+Fields: `id`, `action`, `scope_json`, `granted_by`, `method`, `state`, `single_use`, `receipt_hash`, `generation`, `created_at`, `expires_at`, `revoked_at`.
+
+A grant is standing, pre-approved authority for a repeatable action inside an exact scope, described in 21.6. Consuming a grant mints one single-use approval linked through `approvals.grant_id` in the same transaction, so every use produces its own receipt and audit trail. A `single_use` grant moves to `exhausted` on its first consumption.
 
 #### `events`
 
@@ -469,11 +475,17 @@ Fields: `consumer_id`, `last_acked_seq`, `lease_id`, `generation`, `updated_at`.
 
 Consumers receive events at least once. They acknowledge a sequence only after completing their local action.
 
+#### `consumer_parked_events`
+
+Fields: `consumer_id`, `seq`, `parked_at`.
+
+`(consumer_id, seq)` is unique. A filtered read such as `job wait` may deliver a newer event before an older event its selector did not choose. A shared `last_acked_seq` alone would then skip the older event forever. So when a consumer's cursor advances past an undelivered event of severity `action`, `urgent`, or `error`, that sequence is parked for the consumer in the same transaction. A consumer's unread set is the events past its cursor plus its parked rows, and delivering a parked event deletes its row. This carries forward the Bash `event-state.json` pending checkpoint: a filtered wait must never lose an event for an unselected job. `info` events never park because no wait returns them.
+
 #### `requests`
 
-Fields: `request_id`, `actor_type`, `actor_id`, `command`, `input_sha256`, `state`, `operation_id`, `response_json`, `error_json`, `created_at`, `completed_at`.
+Fields: `request_id`, `actor_type`, `actor_id`, `command`, `protocol_version`, `input_sha256`, `state`, `operation_id`, `response_json`, `error_json`, `created_at`, `completed_at`.
 
-`request_id` is unique. Reusing a request identifier with different input returns a conflict. Completed requests return the stored result.
+`request_id` is unique inside its home database. A replay returns the stored result only when the authenticated actor, command, protocol version, and `input_sha256` all match the stored request; any mismatch returns `state_conflict`. A cached result is never returned across actors, so one caller can never read another caller's privileged response by reusing its request identifier.
 
 #### `operations`
 
@@ -617,6 +629,16 @@ requested|granted -> expired
 
 Grant and denial record the authenticated operator action. Approval consumption and creation of the authorized operation record commit in one transaction, so one approval cannot be raced or replayed. A denied, expired, or consumed approval cannot return to `granted`.
 
+Standing grants (21.6) follow their own machine:
+
+```text
+active -> revoked
+active -> expired
+active -> exhausted     (single-use grant consumed)
+```
+
+Revocation is an operator action and applies to any use whose minted approval has not yet committed. All three terminal grant states fail closed, exactly like an expired approval.
+
 ### 13.7 Check state
 
 ```text
@@ -649,10 +671,10 @@ The token is:
 - stored only as a hash in SQLite;
 - bound to one run and generation;
 - limited to the worker event actions;
-- short-lived and renewable only while the run is active;
-- revoked when the run ends or is replaced.
+- short-lived and renewable while the run is `dispatched`, `active`, or `blocked`;
+- revoked when the run is suspended, ends, or is replaced.
 
-An authenticated heartbeat received before expiry extends `capability_expires_at` while the run is active, capped by the configured maximum run lifetime. It renews the existing opaque token; there is no separate renewal endpoint. An expired token cannot renew itself.
+An authenticated heartbeat received before expiry extends `capability_expires_at` while the run is `dispatched`, `active`, or `blocked`, capped by the configured maximum run lifetime. A blocked run must stay renewable: a decision can wait for days, and 13.2 accepts a terminal worker event while blocked, which only an authenticated token can deliver. The heartbeat renews the existing opaque token; there is no separate renewal endpoint. An expired token cannot renew itself. Suspending a run revokes its capability; `job resume` delivers a fresh capability for the same run through the protected dispatch path before the worker continues.
 
 The service validates the token and writes the event and state transition before acknowledging it. A worker may retry after a lost response without creating a duplicate because every mutation carries an idempotency key.
 
@@ -663,11 +685,11 @@ The worker CLI creates an event UUID before sending and keeps an unsent envelope
 Event delivery is at least once.
 
 - Every home has a monotonic `seq`.
-- Consumers read after their stored cursor.
+- Consumers read the events past their stored cursor plus any sequences parked for them in 12.1.
 - A consumer acknowledges only after its side effect or response is safe.
 - A consumer crash may replay an event.
 - All consumers must therefore be idempotent.
-- Retention may archive old payloads only after every required consumer passes the sequence and audit policy allows it.
+- Retention may archive old payloads only after every required consumer passes the sequence with no parked row at or below it and audit policy allows it.
 
 The stable event representation is:
 
@@ -702,6 +724,7 @@ The initial stable event namespace includes:
 - `check.started`, `check.passed`, `check.failed`, `check.invalidated`;
 - `delivery.requested`, `delivery.awaiting_approval`, `delivery.completed`, `delivery.failed`;
 - `approval.requested`, `approval.granted`, `approval.denied`, `approval.expired`, `approval.consumed`;
+- `grant.created`, `grant.revoked`, `grant.expired`, `grant.exhausted`;
 - `boss.attached`, `boss.detached`, `boss.wake_requested`;
 - `lead.created`, `lead.routed`, `lead.retired`;
 - `system.warning`, `system.reconciled`.
@@ -731,6 +754,7 @@ crewboss job cancel|retry|promote|suspend|resume|remove
 crewboss job diff|logs|report|verify|deliver|focus
 crewboss lead create|list|show|route|pause|resume|retire
 crewboss approval list|show|grant|deny
+crewboss grant create|list|show|revoke
 crewboss backup create|list|verify|restore
 crewboss migrate inspect|apply
 crewboss skill install|status|update
@@ -753,7 +777,7 @@ Aliases accept the old arguments, print one clear deprecation warning in human m
 
 Both `job wait` and its compatibility alias accept one or more selectors. This preserves the existing multi-name wait behavior.
 
-`job wait` blocks until one selected job has an event of severity `action`, `urgent`, or `error` past the caller's cursor, then prints the oldest such event and exits. The first human line is `NAME KIND`; `--json` emits the full event envelope. `info` events never satisfy a wait. The caller names its cursor with `--consumer`; the default is the shared `cli` consumer, and the cursor advances only after the event reaches standard output. The compatibility alias always uses the single `legacy` consumer, mirroring today's one `event-state.json` cursor, and renders `run.question` as `blocked` and `run.completed` as `done` in its first line.
+`job wait` blocks until one selected job has an undelivered event of severity `action`, `urgent`, or `error`, either parked for the caller's consumer or past its cursor, then prints the oldest such event and exits. The first human line is `NAME KIND`; `--json` emits the standard `crewboss.cli.v1` envelope from 15.4 with the full event envelope nested under `data.event`. `info` events never satisfy a wait. The caller names its consumer with `--consumer`; the default is the shared `cli` consumer. The cursor advances only after the event reaches standard output, and that advance parks the skipped actionable events of unselected jobs, as 12.1 requires, so waiting on one job can never lose another job's event. The compatibility alias always uses the single `legacy` consumer, mirroring today's `event-state.json` cursor and pending checkpoint, and renders `run.question` as `blocked` and `run.completed` as `done` in its first line.
 
 `job send` delivers a free-text message to the run's worker through the harness adapter. Unlike `job answer`, it does not resolve a decision. `job diff` shows the run's recorded `base_sha..head_sha` through the worktree adapter and labels the exact SHAs.
 
@@ -825,7 +849,7 @@ Failure uses:
 }
 ```
 
-JSON output writes only the envelope to standard output. Human diagnostics go to standard error. Commands that mutate state accept `--request-id`; retrying the same request returns the original result or its current operation record. The CLI generates a request ID when the flag is absent and returns it in the envelope, so the API requirement in 15.7 always holds.
+JSON output writes only the envelope to standard output. Human diagnostics go to standard error. Commands that mutate state accept `--request-id`; retrying the same request from the same authenticated actor, command, and protocol version returns the original result or its current operation record, under the matching rules in 12.1. The CLI generates a request ID when the flag is absent and returns it in the envelope, so the API requirement in 15.7 always holds.
 
 ### 15.5 Exit codes
 
@@ -902,13 +926,13 @@ POST   /v1/worker/events
 POST   /v1/worker/heartbeat
 ```
 
-Every public CLI command maps to a documented route. The map above is the v0.4 subset; later releases document their routes when the commands ship.
+Every public CLI command maps to a documented route. The map above is the 1.0 core resource map, and each route ships with its owning release: `health`, `status`, `events`, `events/stream`, and consumer acknowledgement in v0.4, where `CREWBOSS_ENGINE=service` remains a contract-test path; project, job, approval, and per-run worker ingress routes in v0.5; boss lease routes in v0.6; `:verify` and `:deliver` in v0.7. Later releases document additional routes when their commands ship.
 
 The two `/v1/worker/*` routes are served only through the run-specific ingress. They are not exposed by the control socket.
 
 Mutations require `X-CrewBoss-Request-ID`. Conditional aggregate updates use `If-Match: <generation>`. Event streaming uses server-sent events and resumes with `Last-Event-ID`; `GET /v1/events` remains the durable catch-up path.
 
-Socket ownership and operating-system peer identity prove only that a caller belongs to the local user account. They do not prove that the process is the operator, boss, or worker. Control requests therefore also require a role credential outside the worker sandbox. Approval grants require a fresh local TTY confirmation or another supported attested operator action; same-user peer credentials alone never grant approval authority.
+Socket ownership and operating-system peer identity prove only that a caller belongs to the local user account. They do not prove that the process is the operator, boss, or worker. Control requests therefore also require a role credential outside the worker sandbox. Approval grants require an operator method from 21.4, preferring an attested user-presence action over plain TTY confirmation; same-user peer credentials alone never grant approval authority.
 
 Workers do not receive the control socket. Each run receives a separate ingress socket or inherited file descriptor that exposes only worker events and heartbeat, plus its scoped bearer capability. The harness sandbox must deny the control socket, SQLite state, configuration, other run directories, and boss or operator credentials. No API accepts a caller role from an untrusted request body.
 
@@ -957,6 +981,8 @@ A queued job is eligible when:
 - required adapters pass health checks;
 - required authority is already present or dispatch itself is safe;
 - no active run already owns the job lease.
+
+A dependency can also stop being completable. When a `blocks` dependency is cancelled, or archived before completing, its dependents keep `queued` but leave the eligible set with `state_reason=dependency_unresolved`, and the service opens an urgent job-scoped decision on each dependent: retry or replace the dependency, drop the edge, or cancel the dependent. A `failed` dependency does not trigger this decision because `failed -> queued` retry remains possible; the scheduler records the skip reason and the supervisor warns when the wait persists. Dependents never sit queued forever without a visible reason and a recorded way out.
 
 ### 17.2 Order
 
@@ -1101,7 +1127,7 @@ GitHub through `gh` is the reference adapter. GitLab follows after the GitHub co
 
 Every adapter returns a versioned capability document. A workflow fails before side effects if required capabilities are missing. Experimental support appears in `doctor` and JSON output; it is never described as verified support.
 
-Harness capability documents report `worker_isolation` as `enforced`, `advisory`, or `none`. `enforced` requires a live conformance probe proving that the worker cannot open the control socket, state database, config, boss credentials, or another run directory while it can still use its own worktree and event ingress. `doctor` runs this probe for every supported harness and profile. A version change invalidates the cached result until the probe passes again.
+Harness capability documents report `worker_isolation` as `enforced`, `advisory`, or `none`. `enforced` requires a live conformance probe proving that the worker cannot open the control socket, state database, config, boss credentials, or another run directory, and cannot reach a network destination outside its profile's egress allowlist in 21.2, while it can still use its own worktree, event ingress, and egress proxy. `doctor` runs this probe for every supported harness and profile. A version change invalidates the cached result until the probe passes again.
 
 ## 20. Supervision, wake-up, and recovery
 
@@ -1193,6 +1219,8 @@ No harness receives a dangerous bypass flag merely because it is installed. The 
 
 Enforcement comes from a deny-by-default filesystem sandbox that the service applies when it launches the harness, not from the harness's own permission prompts. The reference mechanisms are Seatbelt (`sandbox-exec`) on macOS and a Linux user namespace with bind mounts. Each allows only the run's worktree, the run's ingress socket and spool directory, and the declared tool paths, and denies everything else. A harness the service cannot launch inside one of these reports `worker_isolation=none`, whatever its own permission features are.
 
+Isolation constrains the network as well as the filesystem, because a harness needs model-provider connectivity while hostile repository code must not get free egress. The sandbox denies direct outbound network and exposes one service-owned local egress proxy next to the event ingress. The proxy enforces a per-profile host allowlist: `safe` allows only the harness's declared model-provider hosts, `standard` and `autonomous` add the hosts named in the project's `policy_json`, such as a package registry, and `unsafe-host` is unrestricted. The `safe` promise of no network delivery is this allowlist. The 19.5 conformance probe must show that a direct connection and a disallowed proxied host both fail, or the harness reports `worker_isolation=none`.
+
 `crewboss init` and `crewboss doctor` run the isolation probe and record the result. If no supported profile can prove enforcement on this machine, `init` leaves `permission_profile = "standard"` and prints the exact `unsafe-host` activation command. Dispatch then fails with `policy_refused` and repeats that instruction. CrewBoss never lowers the configured profile on its own.
 
 `unsafe-host` is the compatibility escape hatch for a harness that cannot enforce these denials. In that profile, scoped APIs and policy reduce accidental or confused-deputy mistakes, but they do not defend against a hostile process running under the same OS user. The CLI must show this limitation before dispatch and store the operator's expiring approval.
@@ -1213,9 +1241,11 @@ Creating a job, sending a message to its worker, reading owned state, and stoppi
 
 ### 21.4 Approval receipt
 
-An approval records action, exact target, scope, approver identity, method, expiry, and whether it is single-use. The service hashes the receipt and binds it to the external operation. Changing the action invalidates the approval.
+An approval records action, exact target, scope, approver identity, method, and expiry. Every approval is single-use and consumed under 13.6; standing authority for repeatable actions is a grant under 21.6. The service hashes the receipt and binds it to the external operation. Changing the action invalidates the approval.
 
-The attached agent cannot approve its own request. Strong approval comes from a fresh local operator interaction or a supported attested user action. A same-user socket peer, boss message, or worker message is never accepted as operator approval. Reusable approval credentials remain outside every worker sandbox.
+Approval methods are ranked. An `attested` approval comes from an operating-system user-presence check the service can verify, such as Touch ID through LocalAuthentication on macOS or a FIDO2 security-key touch. The mechanism sits behind one internal interface, like the sandbox in 31.9, so it can be replaced without changing the policy model. A `tty` approval is a fresh interactive confirmation on a local terminal. A terminal cannot prove a human: the attached coordinating agent runs under the operator's user ID, controls a terminal, and can read the screen, so it can type the confirmation itself. `tty` therefore protects against accidents and confused-deputy requests, not against a hostile or misaligned boss agent.
+
+The guarantee that an agent cannot approve its own request is enforced only through an attested method. `init` and `doctor` probe which attested mechanism is available and record it. Where one exists, the actions in 21.3 require it. Where none exists, `tty` approvals are accepted, the receipt records the weaker method, and the guarantee narrows to the same honest statement 21.5 makes for `unsafe-host`: policy against mistakes, not a boundary against a hostile same-user agent. A same-user socket peer, boss message, or worker message is never accepted as operator approval. Reusable approval credentials remain outside every worker sandbox.
 
 ### 21.5 Repository trust boundary
 
@@ -1232,6 +1262,12 @@ Repository files, issue text, worker output, and pull-request comments are untru
 - Forge comments cannot change authority without operator confirmation.
 
 These are security guarantees only for adapters whose live isolation probe passes. Under `unsafe-host`, they are API rules rather than a boundary against malicious same-UID code.
+
+### 21.6 Autonomous grants
+
+`merge_authority=policy`, away mode, and autonomous mode act only through the grants recorded in 12.1. A grant names one exact action, scope, grantor, method, expiry, and whether it is single-use, and it can never widen after creation. Granting uses the same operator methods as 21.4. `grant revoke` takes effect for any use whose minted approval has not yet committed.
+
+Each use consumes the grant by minting one single-use approval in the same transaction, so every autonomous action leaves its own receipt and audit entry. An expired, revoked, or exhausted grant fails closed. Policy workflows treat a missing grant exactly like a missing approval: `approval_required`, exit code 5.
 
 ## 22. Verification and delivery
 
@@ -1352,7 +1388,8 @@ The supervisor raises warnings for:
 - event consumer lag;
 - database checkpoint failure;
 - worktree or branch drift;
-- delivery waiting too long on an external system.
+- delivery waiting too long on an external system;
+- jobs queued behind a failed or unresolvable dependency.
 
 Thresholds live in configuration. They are not public CLI timeout arguments on every command.
 
@@ -1371,7 +1408,7 @@ The migration tool reads, without modifying:
 - known CrewBoss-owned Worktrunk worktrees;
 - known Herdr endpoints.
 
-`migrate inspect` produces an import plan and conflicts. `migrate apply` first creates a timestamped backup, imports records in one database transaction, then reconciles external resources.
+`migrate inspect` produces an import plan and conflicts. `migrate apply` first creates a timestamped backup, then imports records in one database transaction. In v0.4 imported endpoints and worktrees are recorded in the `unknown` state, because no adapter exists yet to observe them; the v0.5 adapters reconcile them through the normal 13.3 path. Reconciliation against live external resources is therefore a v0.5 behavior, not a v0.4 promise.
 
 ### 25.3 Mapping
 
@@ -1379,6 +1416,7 @@ The migration tool reads, without modifying:
 - old branch/path/pane/agent -> first imported run and endpoint;
 - old `task` and latest prompt -> job objective and run amendment history;
 - old blocked/done event -> durable event with imported source metadata;
+- old `event-state.json` cursor and pending map -> `legacy` consumer cursor and parked events;
 - old closed crew -> terminal endpoint plus preserved job/run state.
 
 An ambiguous repository or name is not guessed. It becomes an import conflict with a suggested command.
@@ -1459,7 +1497,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - Go CLI and Unix-socket service;
 - XDG home layout and owner-only permissions;
 - SQLite migrations and WAL configuration through `modernc.org/sqlite`;
-- core projects, jobs, runs, endpoints, events, cursors, requests, operations, leases, approvals, and audit tables;
+- core projects, jobs, runs, endpoints, events, consumer cursors with parked events, requests, operations, leases, approvals, and audit tables;
 - transactional domain state changes;
 - idempotent command API;
 - the only implementation of `crewboss.cli.v1`, stable exit codes, and `--request-id`;
@@ -1502,7 +1540,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - explicit worker event commands, per-run ingress, and scoped capabilities;
 - the section 14.4 legacy event bridge, so Bash-spawned workers stay supervised while both engines coexist;
 - an isolation conformance probe for the reference Claude harness and every supported safe profile;
-- enforced worker isolation for `safe`, `standard`, and `autonomous` profiles;
+- enforced worker isolation, including the egress proxy and allowlist, for `safe`, `standard`, and `autonomous` profiles;
 - minimal approval request, grant, deny, expiry, and single-use consumption workflows for `unsafe-host` and later live boss-lease takeover;
 - Explore reports and promotion to Build;
 - project, job, diff, logs, and report commands.
@@ -1515,7 +1553,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - dependency order is stable and explainable;
 - a worker retry cannot duplicate completion or a question;
 - Herdr and Claude complete the reference Build and Explore dispatch contract;
-- with `worker_isolation=enforced`, a worker cannot open the control socket, state database, config, credentials, or another run's files;
+- with `worker_isolation=enforced`, a worker cannot open the control socket, state database, config, credentials, or another run's files, and cannot reach a network destination outside its profile's egress allowlist;
 - without enforced isolation, safe profiles refuse dispatch and only explicitly approved `unsafe-host` is available;
 - an `unsafe-host` approval is exact, expiring, consumed once, and cannot authorize another action;
 - Explore cannot enter code delivery;
@@ -1616,13 +1654,13 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - Codex harness adapter and expanded Claude adapter capabilities at verified quality;
 - OpenCode adapter at verified or clearly experimental quality;
 - permission-profile translation, isolation probes for every supported harness and profile, and gap reporting;
-- autonomous mode with scoped, expiring policy grants;
+- autonomous mode with scoped, expiring policy grants through the 12.1 grants model and `grant` commands;
 - webhook or local notification connector interface;
 - GitLab forge adapter;
 - self-update verification for the pinned Sigstore identity, checksum manifest, and macOS notarization, with explicit install approval;
 - fault-injection and adapter conformance suites.
 
-**Public surface:** adapter selection, permission profiles, `boss mode autonomous`, update status.
+**Public surface:** adapter selection, permission profiles, `boss mode autonomous`, `grant ...`, update status.
 
 **Acceptance gate:**
 
@@ -1631,7 +1669,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - unavailable resume or permission features are reported before dispatch;
 - `doctor` proves each supported safe profile denies control and state paths before it reports `worker_isolation=enforced`;
 - autonomous mode cannot merge or perform destructive cleanup beyond its exact grant;
-- expired grants fail closed;
+- expired, revoked, and exhausted grants fail closed;
 - update verification rejects a wrong signing identity, unsigned manifest, checksum mismatch, or missing required macOS signature/notarization;
 - GitHub and GitLab delivery share the same domain behavior.
 
@@ -1709,7 +1747,7 @@ Release candidates must pass this reproducible scenario on a clean machine:
 13. Remove one worker endpoint during active work and reconcile it without false success.
 14. Change a branch after verification and prove that delivery is invalidated.
 15. Attempt an unapproved merge and destructive cleanup and prove both are refused.
-16. Run a same-user worker probe that attempts to open the control socket, state database, operator credentials, and another run; every safe profile must deny it.
+16. Run a same-user worker probe that attempts to open the control socket, state database, operator credentials, another run, and a network destination outside its egress allowlist; every safe profile must deny it.
 17. Restart the terminal backend and recover owned endpoints where the adapter supports it.
 18. Finish all work and prove safe cleanup of owned worktrees, endpoints, leases, and capabilities.
 
