@@ -245,7 +245,7 @@ The service owns scheduling and deterministic state transitions. The attached co
 - The holder sends heartbeats.
 - A lease has a generation number and expiry.
 - A newer generation makes all commands from an old holder invalid.
-- Taking over a live lease needs operator confirmation unless the lease has expired.
+- Taking over a live lease needs an exact unexpired operator approval unless the lease has expired.
 - Detaching the boss never stops workers or loses events.
 - If no boss is attached, actionable events stay queued and may trigger an OS notification.
 
@@ -362,7 +362,7 @@ lead_runs = 4
 [defaults]
 session = "herdr"
 worktree = "worktrunk"
-harness = "codex"
+harness = "claude"
 delivery = "verified-pr"
 permission_profile = "standard"
 
@@ -408,9 +408,11 @@ Fields: `id`, `home_id`, `slug`, `display_name`, `scope_json`, `routing_rules_js
 
 #### `jobs`
 
-Fields: `id`, `home_id`, `project_id`, `lead_id`, `name`, `title`, `type`, `state`, `state_reason`, `priority`, `tags_json`, `delivery_mode`, `merge_authority`, `requested_by`, `source_ref`, `objective`, `scope_json`, `acceptance_json`, `authority_json`, `current_run_id`, `generation`, `created_at`, `updated_at`, `completed_at`, `cancelled_at`.
+Fields: `id`, `home_id`, `project_id`, `lead_id`, `name`, `title`, `type`, `state`, `state_reason`, `priority`, `tags_json`, `delivery_mode`, `merge_authority`, `requested_by`, `source_ref`, `objective`, `scope_json`, `acceptance_json`, `authority_json`, `current_run_id`, `generation`, `created_at`, `updated_at`, `completed_at`, `cancelled_at`, `archived_at`.
 
-`(project_id, name)` is unique. A globally ambiguous short name produces a clear conflict and requires `project/name`.
+`(project_id, name)` is unique where `archived_at IS NULL`. This lets a project reuse a ticket or job name after the earlier job is archived. A globally ambiguous short name produces a clear conflict and requires `project/name`.
+
+`merge_authority` is `operator` or `policy`. `operator` is the default and requires a matching approval before merge. `policy` permits a merge only when an unexpired autonomous grant covers the exact action and target.
 
 #### `job_dependencies`
 
@@ -438,19 +440,19 @@ Fields: `id`, `home_id`, `adapter`, `external_id`, `kind`, `state`, `semantic_st
 
 #### `decisions`
 
-Fields: `id`, `job_id`, `run_id`, `key`, `question`, `choices_json`, `context_json`, `state`, `answer`, `answered_by`, `generation`, `created_at`, `answered_at`, `expires_at`.
+Fields: `id`, `job_id`, `run_id`, `key`, `question`, `choices_json`, `context_json`, `state`, `answer`, `answered_by`, `replaces_decision_id`, `generation`, `created_at`, `answered_at`, `expires_at`.
 
-`(run_id, key)` is unique. Repeated identical questions are idempotent.
+Partial unique indexes allow only one open decision for each `(run_id, key)` when `run_id IS NOT NULL`, and only one open decision for each `(job_id, key)` when `run_id IS NULL`. Repeated identical open questions are idempotent. Answered, expired, and superseded decisions remain as history. A replacement decision points to the earlier row through `replaces_decision_id`.
 
 #### `approvals`
 
-Fields: `id`, `home_id`, `job_id`, `action`, `target_json`, `scope_json`, `requested_by`, `approved_by`, `method`, `state`, `receipt_hash`, `created_at`, `approved_at`, `expires_at`, `consumed_at`.
+Fields: `id`, `home_id`, `job_id`, `action`, `target_json`, `scope_json`, `requested_by`, `approved_by`, `denied_by`, `method`, `state`, `receipt_hash`, `generation`, `created_at`, `approved_at`, `denied_at`, `expires_at`, `consumed_at`.
 
 An approval is bound to one described action and cannot be widened after creation.
 
 #### `events`
 
-Fields: `home_id`, `seq`, `event_id`, `aggregate_type`, `aggregate_id`, `job_id`, `run_id`, `kind`, `severity`, `dedupe_key`, `payload_json`, `actor_type`, `actor_id`, `created_at`.
+Fields: `home_id`, `seq`, `event_id`, `aggregate_type`, `aggregate_id`, `aggregate_generation`, `job_id`, `run_id`, `kind`, `severity`, `dedupe_key`, `payload_json`, `actor_type`, `actor_id`, `created_at`.
 
 `(home_id, seq)` is the ordered stream key. `event_id` is globally unique. `(actor_id, dedupe_key)` is unique when a deduplication key is supplied.
 
@@ -530,16 +532,16 @@ State axes remain separate. A missing terminal pane must not automatically mean 
 ```text
 draft -> queued -> dispatching -> active
 active -> blocked -> active
-active|blocked -> paused -> active|blocked
+active|blocked -> suspended -> active|blocked
 active -> verifying
 verifying -> waiting -> verifying
 verifying -> ready
 ready -> waiting -> ready
 ready -> complete
 dispatching -> queued            (safe dispatch recovery)
-active|blocked|verifying|waiting -> failed
+active|blocked|verifying|waiting|ready -> failed
 failed -> queued                 (retry)
-draft|queued|dispatching|active|blocked|paused|verifying|waiting|ready -> cancelled
+draft|queued|dispatching|active|blocked|suspended|verifying|waiting|ready -> cancelled
 ```
 
 `waiting` means CrewBoss is waiting for a named external condition, such as CI or an approval. `state_reason` identifies that condition. `ready` means required evidence is valid and delivery may proceed.
@@ -562,10 +564,12 @@ dispatched|active|blocked -> lost
 ### 13.3 Endpoint state
 
 ```text
-creating -> live -> idle -> closed
+creating -> live -> idle
+live|idle -> closed
 creating|live|idle -> missing
 missing -> live|closed
 any observable state -> unknown
+unknown -> live|idle|missing|closed    (reconciliation)
 ```
 
 `semantic_state` is adapter-specific and may include `starting`, `thinking`, `waiting_input`, `running_command`, or `exited`. It is diagnostic and routing input, not completion evidence.
@@ -588,6 +592,16 @@ open -> expired
 
 Expiry does not guess an answer and does not mark the run successful or failed. The run and job remain blocked with `state_reason=decision_expired`. The service emits an urgent boss event. The operator may cancel or retry the job, or provide an answer that creates a replacement decision linked to the expired one and resumes the worker if its endpoint is still usable.
 
+### 13.6 Approval state
+
+```text
+requested -> granted -> consumed
+requested -> denied
+requested|granted -> expired
+```
+
+Grant and denial record the authenticated operator action. Approval consumption and creation of the authorized operation record commit in one transaction, so one approval cannot be raced or replayed. A denied, expired, or consumed approval cannot return to `granted`.
+
 All transitions are checked in the domain layer and committed with the expected generation. A stale caller receives `state_conflict`; it does not overwrite newer state.
 
 ## 14. Event and worker protocol
@@ -605,6 +619,8 @@ crewboss worker heartbeat
 ```
 
 Each worker receives a scoped capability token through a protected file or environment variable.
+
+The brief tells the worker to send a heartbeat immediately after it reads the brief and capability. The first authenticated heartbeat is the dispatch acknowledgement. Pane text and inferred harness state are not acknowledgements.
 
 The token is:
 
@@ -652,16 +668,18 @@ The stable event representation is:
 
 ### 14.3 Event kinds
 
+`severity` is one of `info`, `action`, `urgent`, or `error`. `info` needs no response. `action` needs a normal consumer or operator action. `urgent` is time-sensitive and must wake or notify the boss. `error` reports a failed operation or broken invariant.
+
 The initial stable event namespace includes:
 
 - `project.added`, `project.changed`, `project.archived`;
-- `job.created`, `job.queued`, `job.blocked`, `job.suspended`, `job.resumed`, `job.ready`, `job.completed`, `job.failed`, `job.cancelled`;
+- `job.created`, `job.queued`, `job.blocked`, `job.suspended`, `job.resumed`, `job.ready`, `job.completed`, `job.failed`, `job.cancelled`, `job.archived`;
 - `run.preparing`, `run.started`, `run.progress`, `run.question`, `run.amended`, `run.suspended`, `run.resumed`, `run.completed`, `run.failed`, `run.lost`;
 - `endpoint.changed`, `endpoint.missing`;
-- `decision.opened`, `decision.answered`, `decision.expired`;
+- `decision.opened`, `decision.answered`, `decision.superseded`, `decision.expired`;
 - `check.started`, `check.passed`, `check.failed`, `check.invalidated`;
 - `delivery.requested`, `delivery.awaiting_approval`, `delivery.completed`, `delivery.failed`;
-- `approval.requested`, `approval.granted`, `approval.denied`, `approval.expired`;
+- `approval.requested`, `approval.granted`, `approval.denied`, `approval.expired`, `approval.consumed`;
 - `boss.attached`, `boss.detached`, `boss.wake_requested`;
 - `lead.created`, `lead.routed`, `lead.retired`;
 - `system.warning`, `system.reconciled`.
@@ -688,7 +706,7 @@ crewboss project add|list|show|sync|pause|archive|remove
 crewboss boss attach|status|wake|mode|detach
 crewboss job create|dispatch|list|show|wait|send|answer
 crewboss job cancel|retry|promote|suspend|resume|remove
-crewboss job diff|logs|report|verify|deliver
+crewboss job diff|logs|report|verify|deliver|focus
 crewboss lead create|list|show|route|pause|resume|retire
 crewboss approval list|show|grant|deny
 crewboss backup create|list|verify|restore
@@ -704,16 +722,29 @@ spawn send wait read focus close open remove list
 
 Aliases accept the old arguments, print one clear deprecation warning in human mode, and map to a project-scoped job when unambiguous. They never ask for pane IDs, worktree paths, or internal timeouts.
 
+- `spawn` maps to `job create` followed by `job dispatch` as one idempotent convenience operation.
+- `send` maps to `job send`.
+- `wait` maps to `job wait`.
+- `list` maps to `job list`.
+- `focus` maps to `job focus` through the session adapter.
+- `read` maps to `job logs --snapshot`. It labels the result as a visible endpoint snapshot and returns `backend_unavailable` when no live endpoint can provide one.
+
+Both `job wait` and its compatibility alias accept one or more selectors. This preserves the existing multi-name wait behavior.
+
 The compatibility alias `close` maps to `job suspend`. It records the job and run as suspended before safely closing the worker endpoint. The alias `open` maps to `job resume`. Resume restores the same run only when the harness adapter reports verified resume support; otherwise it returns `backend_unavailable` and recommends `job retry`. `remove` maps to `job remove`, safely cleans CrewBoss-owned runtime resources, and archives the logical job. It does not erase events, approvals, or audit evidence.
+
+`job remove` first completes normal cancellation and cleanup when needed. It sets `archived_at` only after cleanup succeeds or no owned runtime resources remain. It preserves the job's terminal state and all history.
 
 ### 15.2 Names and selectors
 
 - Project slugs are unique in a CrewBoss home.
-- Job names are unique in a project.
+- Non-archived job names are unique in a project.
 - `job-name` works when globally unambiguous.
-- `project/job-name` always works.
+- `project/job-name` selects the non-archived job without global ambiguity.
 - UUIDs are accepted for automation but are not the normal user interface.
 - Internal pane, process, and worktree identifiers do not appear as required arguments.
+
+Name selectors and lists omit archived jobs by default. `--all` includes them. If several archived jobs share one project and name, the qualified name selector returns `ambiguous_selector` and lists the matching UUIDs.
 
 ### 15.3 Naming derivation
 
@@ -723,7 +754,7 @@ Naming carries forward today's `scripts/lib/naming.sh` derivation rules, with on
 2. Otherwise CrewBoss takes the first Jira-style key matching `[A-Za-z][A-Za-z0-9]+-[0-9]+` and lowercases it for the job name, so `CB-142 add retry limits` becomes `cb-142`.
 3. With no ticket, CrewBoss removes ticket-like text, lowercases the task, replaces non-alphanumeric runs with spaces, takes the first four words, and joins them with `-`.
 4. Empty derived names fail with `invalid_argument`.
-5. A name collision inside the project fails with `state_conflict` and asks for `--name`; CrewBoss never silently attaches to the existing job or adds a random suffix.
+5. A name collision with a non-archived job in the project fails with `state_conflict` and asks for `--name`; CrewBoss never silently attaches to the existing job or adds a random suffix.
 
 Branch derivation keeps the current convention:
 
@@ -939,7 +970,7 @@ Dispatch is a recorded saga:
 5. create the session endpoint;
 6. start the selected harness;
 7. deliver the brief and capability;
-8. receive a worker protocol acknowledgement;
+8. receive the worker's first authenticated heartbeat as the protocol acknowledgement;
 9. mark the run active.
 
 Every completed step is recorded. If a later step fails, the service either compensates safely or leaves a visible recoverable operation. It never forgets an orphaned worktree or pane.
@@ -1007,7 +1038,7 @@ Required operations:
 
 Each adapter declares support for resume, non-interactive input, structured hooks, permission controls, model selection, reasoning-effort selection, and worker filesystem isolation. CrewBoss must not claim a capability that has not passed a live test.
 
-Claude and Codex are required for 1.0. OpenCode is the next supported harness. Additional harnesses use the same contract.
+Claude is the reference harness for v0.5 dispatch and isolation. Claude and Codex are required for 1.0. OpenCode is the next supported harness. Additional harnesses use the same contract.
 
 ### 19.4 Forge adapter
 
@@ -1188,7 +1219,7 @@ The default robust pipeline is:
 1. worker completion event;
 2. inspect clean worktree and produced commits;
 3. run project checks;
-4. run configured review jobs in parallel;
+4. run configured review checks in parallel;
 5. resolve required findings or record accepted exceptions;
 6. create or update the PR idempotently;
 7. wait for required CI and review state;
@@ -1380,7 +1411,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - Go CLI and Unix-socket service;
 - XDG home layout and owner-only permissions;
 - SQLite migrations and WAL configuration through `modernc.org/sqlite`;
-- core projects, jobs, runs, endpoints, events, cursors, requests, operations, leases, and audit tables;
+- core projects, jobs, runs, endpoints, events, cursors, requests, operations, leases, approvals, and audit tables;
 - transactional domain state changes;
 - idempotent command API;
 - the only implementation of `crewboss.cli.v1`, stable exit codes, and `--request-id`;
@@ -1402,6 +1433,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - stale generations cannot overwrite new state;
 - the socket refuses another local user;
 - same-user peer credentials alone cannot obtain operator, boss, or approval authority;
+- the approvals table is migrated with its audit relationship, while public approval workflows remain unavailable until v0.5;
 - the reference binary builds with `CGO_ENABLED=0` for macOS and Linux on amd64 and arm64, and release verification accepts only the pinned signing identity and checksums;
 - a clean rollback to the stored backup is documented and tested before new-only work is created.
 
@@ -1417,20 +1449,25 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - job dependencies with cycle detection;
 - deterministic scheduler and concurrency limits;
 - dispatch saga with worktree and endpoint recovery;
+- Herdr session and Claude harness adapters sufficient for reference dispatch;
 - explicit worker event commands, per-run ingress, and scoped capabilities;
+- an isolation conformance probe for the reference Claude harness and every supported safe profile;
 - enforced worker isolation for `safe`, `standard`, and `autonomous` profiles;
+- minimal approval request, grant, deny, expiry, and single-use consumption workflows for `unsafe-host` and later live boss-lease takeover;
 - Explore reports and promotion to Build;
 - project, job, diff, logs, and report commands.
 
-**Public surface:** `project ...`, `job ...`, and internal `worker ...` protocol.
+**Public surface:** `project ...`, `job ...`, `approval list|show|grant|deny`, and internal `worker ...` protocol.
 
 **Acceptance gate:**
 
 - register three repositories and dispatch ten jobs without name collision;
 - dependency order is stable and explainable;
 - a worker retry cannot duplicate completion or a question;
+- Herdr and Claude complete the reference Build and Explore dispatch contract;
 - with `worker_isolation=enforced`, a worker cannot open the control socket, state database, config, credentials, or another run's files;
 - without enforced isolation, safe profiles refuse dispatch and only explicitly approved `unsafe-host` is available;
+- an `unsafe-host` approval is exact, expiring, consumed once, and cannot authorize another action;
 - Explore cannot enter code delivery;
 - promotion begins from a clean current base;
 - no coordinator write occurs in a primary checkout;
@@ -1457,10 +1494,11 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 **Acceptance gate:**
 
 - detach and reattach from another terminal without losing events;
+- taking over a live boss lease requires an exact unexpired approval;
 - an expired old boss cannot acknowledge events after takeover;
 - kill and restart the service, boss endpoint, and one worker endpoint in separate tests;
 - each recovery produces one clear state and no false success;
-- no model process is called for an idle fleet;
+- a one-hour idle-fleet soak records every child process launch and outbound request, with no harness launch and zero requests to a model provider;
 - blocked questions remain queued for at least seven days or configured retention;
 - supervisor retries are bounded and visible.
 
@@ -1470,16 +1508,17 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 
 **Deliver:**
 
-- checks, approvals, and deliveries tables and workflows;
+- checks and deliveries tables and workflows;
+- delivery and destructive-cleanup approval requests built on the v0.5 approval workflow;
 - revision-bound local verification;
 - `verified-pr`, `direct-pr`, `local`, and `report` modes;
 - GitHub/`gh` forge adapter;
 - PR creation/update, CI wait, review status, and merge;
-- review jobs and finding resolution;
+- review checks and finding resolution;
 - local merge with branch-drift protection;
 - safe cleanup and delivery report.
 
-**Public surface:** `job verify`, `job deliver`, `approval ...`, approval prompts, and delivery status.
+**Public surface:** `job verify`, `job deliver`, delivery prompts through the existing `approval ...` commands, and delivery status.
 
 **Acceptance gate:**
 
@@ -1524,9 +1563,9 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 **Deliver:**
 
 - Tmux session adapter at reference quality;
-- Claude and Codex harness adapters at verified quality;
+- Codex harness adapter and expanded Claude adapter capabilities at verified quality;
 - OpenCode adapter at verified or clearly experimental quality;
-- permission-profile translation, isolation conformance probes, and gap reporting;
+- permission-profile translation, isolation probes for every supported harness and profile, and gap reporting;
 - autonomous mode with scoped, expiring policy grants;
 - webhook or local notification connector interface;
 - GitLab forge adapter;
@@ -1569,7 +1608,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - no high-severity unresolved security finding;
 - no known event-loss or unauthorized-delivery path;
 - documentation matches every supported command and adapter capability;
-- upgrade from v0.2 fixture to v1.0 preserves jobs, events, endpoints, and artifacts;
+- upgrade from a v0.2 fixture to v1.0 preserves imported crews as jobs, plus their events and endpoints;
 - a fresh user can install, run `doctor`, register a project, and dispatch a job using only shipped documentation.
 
 ## 27. Feature parity matrix
@@ -1632,7 +1671,7 @@ Pass conditions:
 - primary checkouts remain untouched by worker runs;
 - no unsafe action occurs without a valid approval;
 - every claimed safe profile has recorded `worker_isolation=enforced` evidence;
-- idle supervision makes zero model calls;
+- recorded idle-soak evidence shows that supervision makes zero model calls;
 - the final fleet report explains every job outcome and remaining resource.
 
 ## 29. Testing and quality strategy
@@ -1657,13 +1696,15 @@ Pass conditions:
 
 **Live tests** run supported combinations of Herdr, Tmux, Worktrunk, Claude, Codex, GitHub, and GitLab where credentials and binaries are available.
 
+**Idle-soak tests** inject a recording process launcher and recording outbound transport into the service. Subprocess network traffic uses a counting deny proxy. A one-hour test runs the daemon, supervisor, and an attached but inactive boss lease. Any harness launch or request to a model-provider host fails the gate. Process and request records are stored as release evidence.
+
 ### 29.2 Required performance and reliability targets
 
 - Warm local read commands finish within 100 ms at the 95th percentile for 1,000 jobs.
 - A worker mutation is committed before success is acknowledged.
 - 100 concurrent event writers produce no lost events and one ordered stream.
 - Reconciliation of 100 recorded jobs finishes within 10 seconds, excluding external network wait.
-- An idle service makes zero model calls and uses bounded operating-system polling.
+- The recorded one-hour idle soak shows zero harness launches and zero requests to model-provider hosts, with bounded operating-system polling.
 - Event consumers provide at-least-once handling with demonstrated idempotency.
 - A database crash test never exposes a partially committed domain transition.
 
