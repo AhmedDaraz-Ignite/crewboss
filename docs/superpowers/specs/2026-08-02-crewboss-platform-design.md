@@ -332,14 +332,15 @@ Use XDG paths with documented macOS and Linux fallbacks:
 
 ```text
 $XDG_CONFIG_HOME/crewboss/config.toml
+$XDG_CONFIG_HOME/crewboss/homes/<home>.toml
 $XDG_STATE_HOME/crewboss/<home>/state.db
 $XDG_DATA_HOME/crewboss/<home>/artifacts/
 $XDG_DATA_HOME/crewboss/<home>/briefs/
 $XDG_RUNTIME_DIR/crewboss/<home>/control.sock
-$XDG_RUNTIME_DIR/crewboss/<home>/runs/<run-id>.sock
+$XDG_RUNTIME_DIR/crewboss/<home>/runs/<run-id>/
 ```
 
-State and runtime directories use mode `0700`; databases, tokens, and sensitive configuration use `0600`. The daemon refuses a socket or state directory owned by another user. The control socket is never mounted into a worker sandbox. A run socket is removed when its capability is revoked.
+State and runtime directories use mode `0700`; databases, tokens, and sensitive configuration use `0600`. The daemon refuses a socket or state directory owned by another user. The control socket is never mounted into a worker sandbox. Each run's directory holds its ingress socket and unsent event spool at mode `0700`. The directory and socket are removed when the run's capability is revoked.
 
 ### 11.3 Configuration
 
@@ -370,6 +371,8 @@ permission_profile = "standard"
 enabled = true
 ```
 
+Two homes can differ. `$XDG_CONFIG_HOME/crewboss/homes/<home>.toml` overrides `[limits]`, `[defaults]`, and `[forge.*]` for one home. `crewboss config show --home <home>` prints the effective value and its source file.
+
 Environment variables may select a home or override non-secret runtime values. They must not create hidden policy exceptions. `crewboss config validate` prints all effective sources and rejects unknown keys by default.
 
 ## 12. Domain model and database contract
@@ -377,6 +380,8 @@ Environment variables may select a home or override non-secret runtime values. T
 IDs use UUIDv7. Times use UTC RFC 3339 with microseconds at API boundaries. JSON payloads carry a schema version. Each mutable aggregate has an integer `generation` used for compare-and-swap updates.
 
 ### 12.1 Required tables
+
+Each CrewBoss home is one database file. A home is a whole database, not a row inside a shared one, so `home_id` is not a column on domain tables. The `homes` table holds one row identifying the file's own home slug, and the service refuses to open a database whose slug does not match the requested home. `events.seq` alone orders the stream. API payloads still carry `"home"` so a reader never has to infer it.
 
 #### `schema_migrations`
 
@@ -390,27 +395,27 @@ Fields: `id`, `slug`, `display_name`, `config_revision`, `created_at`, `updated_
 
 #### `projects`
 
-Fields: `id`, `home_id`, `slug`, `display_name`, `repo_root`, `repo_identity`, `canonical_remote`, `base_branch`, `session_adapter`, `worktree_adapter`, `harness_defaults_json`, `forge_config_json`, `status`, `generation`, `created_at`, `updated_at`, `archived_at`.
+Fields: `id`, `slug`, `display_name`, `repo_root`, `repo_identity`, `canonical_remote`, `base_branch`, `session_adapter`, `worktree_adapter`, `harness_defaults_json`, `forge_config_json`, `status`, `generation`, `created_at`, `updated_at`, `archived_at`.
 
-`(home_id, slug)` and `(home_id, repo_identity)` are unique for active projects. `repo_identity` is derived from the canonical repository identity, not only the current path.
+`slug` and `repo_identity` are unique for active projects. `repo_identity` is derived from the canonical repository identity, not only the current path.
 
 #### `boss_sessions`
 
-Fields: `id`, `home_id`, `endpoint_id`, `holder_identity`, `lease_id`, `state`, `generation`, `attached_at`, `heartbeat_at`, `expires_at`, `detached_at`.
+Fields: `id`, `endpoint_id`, `holder_identity`, `lease_id`, `state`, `generation`, `attached_at`, `heartbeat_at`, `expires_at`, `detached_at`.
 
 Only one unexpired active boss session may exist per home.
 
 #### `leads`
 
-Fields: `id`, `home_id`, `slug`, `display_name`, `scope_json`, `routing_rules_json`, `endpoint_id`, `harness_config_json`, `status`, `generation`, `created_at`, `updated_at`, `retired_at`.
+Fields: `id`, `slug`, `display_name`, `scope_json`, `routing_rules_json`, `endpoint_id`, `harness_config_json`, `status`, `generation`, `created_at`, `updated_at`, `retired_at`.
 
-`(home_id, slug)` is unique for non-retired leads.
+`slug` is unique for non-retired leads.
 
 #### `jobs`
 
-Fields: `id`, `home_id`, `project_id`, `lead_id`, `name`, `title`, `type`, `state`, `state_reason`, `priority`, `tags_json`, `delivery_mode`, `merge_authority`, `requested_by`, `source_ref`, `objective`, `scope_json`, `acceptance_json`, `authority_json`, `current_run_id`, `generation`, `created_at`, `updated_at`, `completed_at`, `cancelled_at`, `archived_at`.
+Fields: `id`, `project_id`, `lead_id`, `name`, `title`, `type`, `state`, `state_reason`, `priority`, `tags_json`, `delivery_mode`, `merge_authority`, `requested_by`, `source_ref`, `objective`, `scope_json`, `acceptance_json`, `authority_json`, `current_run_id`, `generation`, `created_at`, `updated_at`, `completed_at`, `cancelled_at`, `archived_at`.
 
-`(project_id, name)` is unique where `archived_at IS NULL`. This lets a project reuse a ticket or job name after the earlier job is archived. A globally ambiguous short name produces a clear conflict and requires `project/name`.
+`(project_id, name)` is unique where `archived_at IS NULL`. This lets a project reuse a ticket or job name after the earlier job is archived. A globally ambiguous short name produces a clear conflict and requires `project/name`. `title` defaults to the raw task text; `name` follows the derivation rules in 15.3.
 
 `merge_authority` is `operator` or `policy`. `operator` is the default and requires a matching approval before merge. `policy` permits a merge only when an unexpired autonomous grant covers the exact action and target.
 
@@ -434,7 +439,7 @@ Fields: `id`, `job_id`, `attempt`, `state`, `brief_id`, `base_ref`, `base_sha`, 
 
 #### `endpoints`
 
-Fields: `id`, `home_id`, `adapter`, `external_id`, `kind`, `state`, `semantic_state`, `metadata_json`, `last_seen_at`, `generation`, `created_at`, `closed_at`.
+Fields: `id`, `adapter`, `external_id`, `kind`, `state`, `semantic_state`, `metadata_json`, `last_seen_at`, `generation`, `created_at`, `closed_at`.
 
 `external_id` is internal. Users are never required to type it.
 
@@ -442,37 +447,39 @@ Fields: `id`, `home_id`, `adapter`, `external_id`, `kind`, `state`, `semantic_st
 
 Fields: `id`, `job_id`, `run_id`, `key`, `question`, `choices_json`, `context_json`, `state`, `answer`, `answered_by`, `replaces_decision_id`, `generation`, `created_at`, `answered_at`, `expires_at`.
 
-Partial unique indexes allow only one open decision for each `(run_id, key)` when `run_id IS NOT NULL`, and only one open decision for each `(job_id, key)` when `run_id IS NULL`. Repeated identical open questions are idempotent. Answered, expired, and superseded decisions remain as history. A replacement decision points to the earlier row through `replaces_decision_id`.
+Partial unique indexes allow only one open decision for each `(run_id, key)` when `run_id IS NOT NULL`, and only one open decision for each `(job_id, key)` when `run_id IS NULL`. Repeated identical open questions are idempotent. Answered, expired, and superseded decisions remain as history. A replacement decision points to the earlier row through `replaces_decision_id`. A decision superseded by its run ending terminally has no replacement row; `replaces_decision_id` stays null.
 
 #### `approvals`
 
-Fields: `id`, `home_id`, `job_id`, `action`, `target_json`, `scope_json`, `requested_by`, `approved_by`, `denied_by`, `method`, `state`, `receipt_hash`, `generation`, `created_at`, `approved_at`, `denied_at`, `expires_at`, `consumed_at`.
+Fields: `id`, `job_id`, `action`, `target_json`, `scope_json`, `requested_by`, `approved_by`, `denied_by`, `method`, `state`, `receipt_hash`, `generation`, `created_at`, `approved_at`, `denied_at`, `expires_at`, `consumed_at`.
 
 An approval is bound to one described action and cannot be widened after creation.
 
 #### `events`
 
-Fields: `home_id`, `seq`, `event_id`, `aggregate_type`, `aggregate_id`, `aggregate_generation`, `job_id`, `run_id`, `kind`, `severity`, `dedupe_key`, `payload_json`, `actor_type`, `actor_id`, `created_at`.
+Fields: `seq`, `event_id`, `aggregate_type`, `aggregate_id`, `aggregate_generation`, `job_id`, `run_id`, `kind`, `severity`, `dedupe_key`, `payload_json`, `actor_type`, `actor_id`, `created_at`.
 
-`(home_id, seq)` is the ordered stream key. `event_id` is globally unique. `(actor_id, dedupe_key)` is unique when a deduplication key is supplied.
+`seq` is the ordered stream key. `event_id` is globally unique. `(actor_id, dedupe_key)` is unique when a deduplication key is supplied.
 
 #### `consumer_cursors`
 
-Fields: `home_id`, `consumer_id`, `last_acked_seq`, `lease_id`, `generation`, `updated_at`.
+Fields: `consumer_id`, `last_acked_seq`, `lease_id`, `generation`, `updated_at`.
+
+`consumer_id` is unique.
 
 Consumers receive events at least once. They acknowledge a sequence only after completing their local action.
 
 #### `requests`
 
-Fields: `home_id`, `request_id`, `actor_type`, `actor_id`, `command`, `input_sha256`, `state`, `operation_id`, `response_json`, `error_json`, `created_at`, `completed_at`.
+Fields: `request_id`, `actor_type`, `actor_id`, `command`, `input_sha256`, `state`, `operation_id`, `response_json`, `error_json`, `created_at`, `completed_at`.
 
-`(home_id, request_id)` is unique. Reusing a request identifier with different input returns a conflict. Completed requests return the stored result.
+`request_id` is unique. Reusing a request identifier with different input returns a conflict. Completed requests return the stored result.
 
 #### `operations`
 
-Fields: `id`, `home_id`, `aggregate_type`, `aggregate_id`, `kind`, `state`, `idempotency_key`, `step`, `attempt`, `next_attempt_at`, `input_json`, `observation_json`, `result_json`, `error_json`, `generation`, `created_at`, `updated_at`, `completed_at`.
+Fields: `id`, `aggregate_type`, `aggregate_id`, `kind`, `state`, `idempotency_key`, `step`, `attempt`, `next_attempt_at`, `input_json`, `observation_json`, `result_json`, `error_json`, `generation`, `created_at`, `updated_at`, `completed_at`.
 
-This table records sagas for external work such as creating a worktree, starting an endpoint, opening a PR, or merging. `(home_id, kind, idempotency_key)` is unique.
+This table records sagas for external work such as creating a worktree, starting an endpoint, opening a PR, or merging. `(kind, idempotency_key)` is unique.
 
 #### `artifacts`
 
@@ -492,13 +499,13 @@ Fields: `id`, `job_id`, `run_id`, `mode`, `state`, `head_sha`, `base_sha`, `targ
 
 #### `leases`
 
-Fields: `id`, `home_id`, `resource_type`, `resource_id`, `holder`, `purpose`, `generation`, `acquired_at`, `heartbeat_at`, `expires_at`, `released_at`.
+Fields: `id`, `resource_type`, `resource_id`, `holder`, `purpose`, `generation`, `acquired_at`, `heartbeat_at`, `expires_at`, `released_at`.
 
 `(resource_type, resource_id)` has at most one active generation.
 
 #### `audit_entries`
 
-Fields: `home_id`, `seq`, `entry_id`, `request_id`, `actor_type`, `actor_id`, `action`, `target_json`, `policy_result`, `approval_id`, `before_hash`, `after_hash`, `created_at`.
+Fields: `seq`, `entry_id`, `request_id`, `actor_type`, `actor_id`, `action`, `target_json`, `policy_result`, `approval_id`, `before_hash`, `after_hash`, `created_at`.
 
 Audit entries are append-only through the public service API.
 
@@ -533,18 +540,20 @@ State axes remain separate. A missing terminal pane must not automatically mean 
 draft -> queued -> dispatching -> active
 active -> blocked -> active
 active|blocked -> suspended -> active|blocked
-active -> verifying
+active|blocked -> verifying
 verifying -> waiting -> verifying
 verifying -> ready
 ready -> waiting -> ready
 ready -> complete
 dispatching -> queued            (safe dispatch recovery)
-active|blocked|verifying|waiting|ready -> failed
+dispatching|active|blocked|suspended|verifying|waiting|ready -> failed
 failed -> queued                 (retry)
 draft|queued|dispatching|active|blocked|suspended|verifying|waiting|ready -> cancelled
 ```
 
 `waiting` means CrewBoss is waiting for a named external condition, such as CI or an approval. `state_reason` identifies that condition. `ready` means required evidence is valid and delivery may proceed.
+
+Dispatch recovery is bounded. When the recorded dispatch operation exhausts its retry policy, the job moves to `failed` with `state_reason=dispatch_failed` instead of returning to `queued` again.
 
 Cancelling during `dispatching` first marks the dispatch operation `cancel_requested`. The service unwinds or records every external saga step before it commits `cancelled`. If cleanup cannot finish, the job remains visible with `state_reason=cancel_cleanup`; it is never hidden as successfully cancelled.
 
@@ -553,13 +562,17 @@ Cancelling during `dispatching` first marks the dispatch operation `cancel_reque
 ```text
 preparing -> dispatched -> active -> succeeded
 dispatched|active -> blocked -> active
+blocked -> succeeded                         (terminal worker event while blocked)
 active|blocked -> suspended -> active|blocked
 preparing|dispatched|active|blocked|suspended -> failed
 preparing|dispatched|active|blocked|suspended -> cancelled
 dispatched|active|blocked -> lost
+lost -> active|failed|cancelled              (reconciliation)
 ```
 
-`lost` means the endpoint disappeared without an authoritative worker result. Reconciliation may restore the endpoint or create a controlled retry. It must not convert `lost` to `succeeded` from screen text.
+`lost` means the endpoint disappeared without an authoritative worker result. Reconciliation returns a run to `active` only after an authenticated worker heartbeat on the same run generation. A restored endpoint, a present worktree, or screen text is never enough. Otherwise reconciliation records `failed` or `cancelled`, or the operator retries into a new run.
+
+A terminal worker event received while a run is blocked is accepted, not rejected. The service marks the run's open decisions `superseded` with no replacement row, records the terminal transition, and keeps the unanswered question in history. Rejecting it would discard authoritative worker evidence and strand the run.
 
 ### 13.3 Endpoint state
 
@@ -577,8 +590,10 @@ unknown -> live|idle|missing|closed    (reconciliation)
 ### 13.4 Delivery state
 
 ```text
-none -> pending -> awaiting_approval -> delivering -> delivered
+none -> pending -> delivering -> delivered
+pending -> awaiting_approval -> delivering
 pending|awaiting_approval|delivering -> failed
+awaiting_approval|delivering -> pending      (approval denied, or base/head moved)
 failed -> pending
 ```
 
@@ -601,6 +616,13 @@ requested|granted -> expired
 ```
 
 Grant and denial record the authenticated operator action. Approval consumption and creation of the authorized operation record commit in one transaction, so one approval cannot be raced or replayed. A denied, expired, or consumed approval cannot return to `granted`.
+
+### 13.7 Check state
+
+```text
+pending -> running -> passed|failed
+passed|failed -> invalidated     (head_sha moved)
+```
 
 All transitions are checked in the domain layer and committed with the expected generation. A stale caller receives `state_conflict`; it does not overwrite newer state.
 
@@ -731,6 +753,10 @@ Aliases accept the old arguments, print one clear deprecation warning in human m
 
 Both `job wait` and its compatibility alias accept one or more selectors. This preserves the existing multi-name wait behavior.
 
+`job wait` blocks until one selected job has an event of severity `action`, `urgent`, or `error` past the caller's cursor, then prints the oldest such event and exits. The first human line is `NAME KIND`; `--json` emits the full event envelope. `info` events never satisfy a wait. The caller names its cursor with `--consumer`; the default is the shared `cli` consumer, and the cursor advances only after the event reaches standard output. The compatibility alias always uses the single `legacy` consumer, mirroring today's one `event-state.json` cursor, and renders `run.question` as `blocked` and `run.completed` as `done` in its first line.
+
+`job send` delivers a free-text message to the run's worker through the harness adapter. Unlike `job answer`, it does not resolve a decision. `job diff` shows the run's recorded `base_sha..head_sha` through the worktree adapter and labels the exact SHAs.
+
 The compatibility alias `close` maps to `job suspend`. It records the job and run as suspended before safely closing the worker endpoint. The alias `open` maps to `job resume`. Resume restores the same run only when the harness adapter reports verified resume support; otherwise it returns `backend_unavailable` and recommends `job retry`. `remove` maps to `job remove`, safely cleans CrewBoss-owned runtime resources, and archives the logical job. It does not erase events, approvals, or audit evidence.
 
 `job remove` first completes normal cancellation and cleanup when needed. It sets `archived_at` only after cleanup succeeds or no owned runtime resources remain. It preserves the job's terminal state and all history.
@@ -799,7 +825,7 @@ Failure uses:
 }
 ```
 
-JSON output writes only the envelope to standard output. Human diagnostics go to standard error. Commands that mutate state accept `--request-id`; retrying the same request returns the original result or its current operation record.
+JSON output writes only the envelope to standard output. Human diagnostics go to standard error. Commands that mutate state accept `--request-id`; retrying the same request returns the original result or its current operation record. The CLI generates a request ID when the flag is absent and returns it in the envelope, so the API requirement in 15.7 always holds.
 
 ### 15.5 Exit codes
 
@@ -817,6 +843,21 @@ JSON output writes only the envelope to standard output. Human diagnostics go to
 | 9 | Internal invariant or storage failure. |
 
 Stable error codes include `invalid_argument`, `not_found`, `ambiguous_selector`, `state_conflict`, `approval_required`, `policy_refused`, `backend_unavailable`, `external_retryable`, `invalid_capability`, `unsupported_protocol`, `integrity_failure`, and `internal`. A new code may be added in version 1, but the meaning of an existing code cannot change.
+
+Each stable error code maps to exactly one exit code:
+
+| Exit | Error codes |
+| --- | --- |
+| 2 | `invalid_argument`, `ambiguous_selector` |
+| 3 | `not_found` |
+| 4 | `state_conflict` |
+| 5 | `approval_required` |
+| 6 | `backend_unavailable`, `unsupported_protocol` |
+| 7 | `external_retryable` |
+| 8 | `policy_refused`, `invalid_capability` |
+| 9 | `integrity_failure`, `internal` |
+
+A new error code must declare its exit code in the same commit.
 
 ### 15.6 API boundary
 
@@ -860,6 +901,8 @@ POST   /v1/approvals/{id}:deny
 POST   /v1/worker/events
 POST   /v1/worker/heartbeat
 ```
+
+Every public CLI command maps to a documented route. The map above is the v0.4 subset; later releases document their routes when the commands ship.
 
 The two `/v1/worker/*` routes are served only through the run-specific ingress. They are not exposed by the control socket.
 
@@ -1021,7 +1064,7 @@ Required operations:
 - `RemoveWorktree`
 - `ListOwnedWorktrees`
 
-Worktrunk is the reference adapter. A native Git adapter is optional but useful for portability. The domain layer owns lifecycle policy; an adapter owns tool syntax.
+Worktrunk is the reference adapter. It owns creation, path resolution, and removal. `Diff`, `Merge`, and `InspectWorktree` are Git operations the adapter performs directly, because Worktrunk does not expose them; the current Bash code already shells out to plain `git -C` for inspection. A native Git adapter is optional but useful for portability. The domain layer owns lifecycle policy; an adapter owns tool syntax.
 
 ### 19.3 Harness adapter
 
@@ -1147,6 +1190,10 @@ Each action records its actor and effective authority.
 No harness receives a dangerous bypass flag merely because it is installed. The harness adapter translates a CrewBoss permission profile to supported vendor controls and reports any gap.
 
 `safe`, `standard`, and `autonomous` require `worker_isolation=enforced`. Their sandbox denies the CrewBoss control socket, state and configuration roots, operator and boss credentials, unrelated worktrees, and other run directories. It exposes only the run's worktree, declared tool paths, and per-run event ingress. Dispatch fails closed if any required denial cannot be proved.
+
+Enforcement comes from a deny-by-default filesystem sandbox that the service applies when it launches the harness, not from the harness's own permission prompts. The reference mechanisms are Seatbelt (`sandbox-exec`) on macOS and a Linux user namespace with bind mounts. Each allows only the run's worktree, the run's ingress socket and spool directory, and the declared tool paths, and denies everything else. A harness the service cannot launch inside one of these reports `worker_isolation=none`, whatever its own permission features are.
+
+`crewboss init` and `crewboss doctor` run the isolation probe and record the result. If no supported profile can prove enforcement on this machine, `init` leaves `permission_profile = "standard"` and prints the exact `unsafe-host` activation command. Dispatch then fails with `policy_refused` and repeats that instruction. CrewBoss never lowers the configured profile on its own.
 
 `unsafe-host` is the compatibility escape hatch for a harness that cannot enforce these denials. In that profile, scoped APIs and policy reduce accidental or confused-deputy mistakes, but they do not defend against a hostile process running under the same OS user. The CLI must show this limitation before dispatch and store the operator's expiring approval.
 
@@ -1319,7 +1366,7 @@ The old commands remain supported through the full 1.x release line. They may be
 
 The migration tool reads, without modifying:
 
-- current `crew.json` registry;
+- the `crew.json` registry, both the captured v0.2 fixture format and the final v0.3 format with project identity;
 - the merged PR #2 `events.jsonl` and `event-state.json` formats;
 - known CrewBoss-owned Worktrunk worktrees;
 - known Herdr endpoints.
@@ -1342,7 +1389,7 @@ During the bridge release:
 
 - `CREWBOSS_ENGINE=bash` selects the old implementation;
 - `CREWBOSS_ENGINE=service` selects the new implementation;
-- the default changes only after contract and migration tests pass;
+- the default changes only after the service implements every compatibility command and the contract, migration, and live dispatch tests pass, which is v0.5 at the earliest;
 - the Bash engine is frozen as a rollback path and does not implement `crewboss.cli.v1`;
 - rollback keeps the pre-migration backup and does not pretend new service state can always be represented by the old registry.
 
@@ -1386,7 +1433,8 @@ Each release is independently releasable. Reliability gates are mandatory even w
 - no hard-coded unsafe harness mode;
 - `doctor` with adapter and version checks;
 - explicit labels for pane snapshots;
-- frozen behavior and naming fixtures for the rollback engine.
+- frozen behavior and naming fixtures for the rollback engine;
+- refreshed migration fixtures for the v0.3 registry format, since project identity changes the schema the v0.2 fixtures captured.
 
 This release fixes Bash safety and repository-scoping defects only. It does not implement `crewboss.cli.v1`, request idempotency, or the new exit-code contract. Those fixtures are written now, but Go is their only implementation in v0.4.
 
@@ -1417,11 +1465,12 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - the only implementation of `crewboss.cli.v1`, stable exit codes, and `--request-id`;
 - contract fixtures written before the service implementation;
 - Bash CLI shim and engine switch;
+- `crewboss skill install|status|update` for managing the installed agent instructions;
 - `migrate inspect` and `migrate apply`;
 - service-owned backup creation, verification, and restore;
 - Sigstore-signed release checksums, plus Developer ID signing and notarization on macOS.
 
-**Public surface:** `daemon`, `config`, `backup`, `migrate`, and compatibility commands backed by the service.
+**Public surface:** `daemon`, `config`, `backup`, `migrate`, and `skill`. The engine switch exists, but `CREWBOSS_ENGINE=service` is a contract-test and migration-rehearsal path in this release: the service cannot run endpoint or worktree commands until the v0.5 adapters exist, and the section 14.4 legacy event bridge also arrives with v0.5 dispatch. The default engine remains `bash`.
 
 **Acceptance gate:**
 
@@ -1451,6 +1500,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - dispatch saga with worktree and endpoint recovery;
 - Herdr session and Claude harness adapters sufficient for reference dispatch;
 - explicit worker event commands, per-run ingress, and scoped capabilities;
+- the section 14.4 legacy event bridge, so Bash-spawned workers stay supervised while both engines coexist;
 - an isolation conformance probe for the reference Claude harness and every supported safe profile;
 - enforced worker isolation for `safe`, `standard`, and `autonomous` profiles;
 - minimal approval request, grant, deny, expiry, and single-use consumption workflows for `unsafe-host` and later live boss-lease takeover;
@@ -1787,6 +1837,12 @@ Metrics are available locally through `crewboss status --json` and a disabled-by
 **Risk:** Unix peer credentials authenticate a user ID, not an agent role. Without a sandbox, a hostile worker running under the operator's UID can reach user-owned files, copy credentials, open SQLite directly, or call the control socket as the same user.
 
 **Decision:** Role-isolation claims require a live-tested harness sandbox that denies control, state, configuration, credential, and unrelated run paths. Workers receive only a per-run event ingress. Safe profiles fail closed without this capability. `unsafe-host` remains available through explicit expiring approval, but its policy is not described as a security boundary against hostile same-UID code.
+
+### 31.9 The sandbox mechanism is platform-specific and not guaranteed
+
+**Risk:** `sandbox-exec` is deprecated by Apple, and Linux user namespaces are restricted or unavailable on some hosts and inside some containers. If the reference mechanism disappears, every safe profile loses enforcement at once.
+
+**Decision:** Isolation is applied by the service, behind one internal interface, so a mechanism can be replaced without touching the policy model. The probe is the contract, not the mechanism. When no mechanism passes, CrewBoss reports `worker_isolation=none` and offers only `unsafe-host` with an expiring approval. It never redefines a weaker mechanism as enforced.
 
 ## 32. Post-1.0 differentiators
 
