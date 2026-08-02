@@ -340,7 +340,7 @@ $XDG_RUNTIME_DIR/crewboss/<home>/control.sock
 $XDG_RUNTIME_DIR/crewboss/<home>/runs/<run-id>/
 ```
 
-State and runtime directories use mode `0700`; databases, tokens, and sensitive configuration use `0600`. The daemon refuses a socket or state directory owned by another user. The control socket is never mounted into a worker sandbox. Each run's directory holds its ingress socket and unsent event spool at mode `0700`. The directory and socket are removed when the run's capability is revoked.
+State and runtime directories use mode `0700`; databases, tokens, and sensitive configuration use `0600`. The daemon refuses a socket or state directory owned by another user. The control socket is never mounted into a worker sandbox. Each run's directory holds its event ingress, provider-gateway ingress, and unsent event spool at mode `0700`. The two ingresses use different capabilities and expose disjoint protocols. The directory and sockets are removed when the run's capabilities are revoked.
 
 ### 11.3 Configuration
 
@@ -387,6 +387,12 @@ Each CrewBoss home is one database file. A home is a whole database, not a row i
 
 Fields: `version`, `name`, `checksum`, `applied_at`.
 
+#### `legacy_import_checkpoints`
+
+Fields: `source_id`, `source_format`, `registry_revision`, `registry_sha256`, `last_event_seq`, `last_event_sha256`, `event_state_revision`, `event_state_sha256`, `cutover_spool_sha256`, `authority_state`, `generation`, `inspected_at`, `imported_at`, `cutover_at`.
+
+There is one row for the legacy Bash home. `authority_state` is `rehearsal`, `cutover_pending`, or `service_authoritative`. The checkpoint identifies one stable legacy snapshot and makes repeated imports idempotent. It never stores a raw capability or credential. Once it reaches `service_authoritative`, an older checkpoint cannot be imported and the legacy engine cannot become a writer again without restoring the pre-cutover home backup.
+
 #### `homes`
 
 Fields: `id`, `slug`, `display_name`, `config_revision`, `created_at`, `updated_at`.
@@ -413,11 +419,13 @@ Fields: `id`, `slug`, `display_name`, `scope_json`, `routing_rules_json`, `endpo
 
 #### `jobs`
 
-Fields: `id`, `project_id`, `lead_id`, `name`, `title`, `type`, `state`, `state_reason`, `priority`, `tags_json`, `delivery_mode`, `merge_authority`, `requested_by`, `source_ref`, `objective`, `scope_json`, `acceptance_json`, `authority_json`, `current_run_id`, `generation`, `created_at`, `updated_at`, `completed_at`, `cancelled_at`, `archived_at`.
+Fields: `id`, `project_id`, `lead_id`, `name`, `title`, `type`, `state`, `state_reason`, `return_state`, `priority`, `tags_json`, `delivery_mode`, `merge_authority`, `requested_by`, `source_ref`, `objective`, `scope_json`, `acceptance_json`, `authority_json`, `current_run_id`, `generation`, `created_at`, `updated_at`, `completed_at`, `cancelled_at`, `archived_at`.
 
 `(project_id, name)` is unique where `archived_at IS NULL`. This lets a project reuse a ticket or job name after the earlier job is archived. A globally ambiguous short name produces a clear conflict and requires `project/name`. `title` defaults to the raw task text; `name` follows the derivation rules in 15.3.
 
 `merge_authority` is `operator` or `policy`. `operator` is the default and requires a matching approval before merge. `policy` permits a merge only when an unexpired autonomous grant covers the exact action and target.
+
+`return_state` is non-null only while the job is `suspended` or `waiting`. For `suspended` it is `active` or `blocked`; for `waiting` it is `verifying` or `ready`. Database constraints and the domain layer reject every other pair.
 
 #### `job_dependencies`
 
@@ -433,9 +441,17 @@ A brief is immutable after its linked run starts. `runs.brief_id` is a non-null 
 
 #### `runs`
 
-Fields: `id`, `job_id`, `attempt`, `state`, `brief_id`, `base_ref`, `base_sha`, `branch`, `worktree_path`, `endpoint_id`, `worker_identity`, `capability_hash`, `capability_expires_at`, `head_sha`, `result_summary`, `failure_code`, `generation`, `created_at`, `dispatched_at`, `started_at`, `heartbeat_at`, `finished_at`.
+Fields: `id`, `job_id`, `attempt`, `state`, `return_state`, `brief_id`, `base_ref`, `base_sha`, `branch`, `worktree_path`, `endpoint_id`, `worker_identity`, `capability_hash`, `capability_expires_at`, `head_sha`, `result_summary`, `failure_code`, `generation`, `created_at`, `dispatched_at`, `started_at`, `heartbeat_at`, `finished_at`.
 
 `(job_id, attempt)` and `brief_id` are unique. A retry always creates a new run and a new brief.
+
+`runs.return_state` is non-null only while the run is `suspended`, and is then `active` or `blocked`.
+
+#### `provider_sessions`
+
+Fields: `id`, `run_id`, `harness_adapter`, `provider`, `auth_mode`, `state`, `capability_hash`, `capability_expires_at`, `generation`, `created_at`, `last_used_at`, `revoked_at`.
+
+One run has at most one active provider session. `auth_mode` is `brokered` or `provider_run_scoped` for an enforced sandbox; `host_inherited` is allowed only under `unsafe-host`. The row stores only the hash of the run-scoped gateway capability or provider-issued run token. Upstream API keys, OAuth refresh tokens, cookies, and harness account files never enter SQLite, artifacts, briefs, worker files, or logs.
 
 #### `endpoints`
 
@@ -491,7 +507,7 @@ Fields: `request_id`, `actor_type`, `actor_id`, `command`, `protocol_version`, `
 
 Fields: `id`, `aggregate_type`, `aggregate_id`, `kind`, `state`, `idempotency_key`, `step`, `attempt`, `next_attempt_at`, `input_json`, `observation_json`, `result_json`, `error_json`, `generation`, `created_at`, `updated_at`, `completed_at`.
 
-This table records sagas for external work such as creating a worktree, starting an endpoint, opening a PR, or merging. `(kind, idempotency_key)` is unique.
+This table records sagas for external work such as creating a worktree, starting an endpoint, publishing a revision, opening a PR, or merging. `(kind, idempotency_key)` is unique.
 
 #### `artifacts`
 
@@ -507,7 +523,9 @@ Passing evidence is valid only for the recorded `head_sha`.
 
 #### `deliveries`
 
-Fields: `id`, `job_id`, `run_id`, `mode`, `state`, `head_sha`, `base_sha`, `target_branch`, `forge`, `external_ref`, `url`, `approval_id`, `evidence_json`, `generation`, `created_at`, `updated_at`, `delivered_at`.
+Fields: `id`, `job_id`, `run_id`, `mode`, `state`, `head_sha`, `base_sha`, `source_ref`, `published_sha`, `target_branch`, `forge`, `external_ref`, `url`, `approval_id`, `evidence_json`, `generation`, `created_at`, `updated_at`, `delivered_at`.
+
+`source_ref` is the exact service-owned remote ref used for a PR. `published_sha` is null until the forge adapter observes that ref at `head_sha`. PR creation and remote-check evidence are invalid unless `published_sha = head_sha`.
 
 #### `leases`
 
@@ -551,11 +569,12 @@ State axes remain separate. A missing terminal pane must not automatically mean 
 ```text
 draft -> queued -> dispatching -> active
 active -> blocked -> active
-active|blocked -> suspended -> active|blocked
+active -> suspended(return_state=active) -> active
+blocked -> suspended(return_state=blocked) -> blocked
 active|blocked -> verifying
-verifying -> waiting -> verifying
+verifying -> waiting(return_state=verifying) -> verifying
 verifying -> ready
-ready -> waiting -> ready
+ready -> waiting(return_state=ready) -> ready
 ready -> complete
 dispatching -> queued            (safe dispatch recovery)
 dispatching|active|blocked|suspended|verifying|waiting|ready -> failed
@@ -564,6 +583,8 @@ draft|queued|dispatching|active|blocked|suspended|verifying|waiting|ready -> can
 ```
 
 `waiting` means CrewBoss is waiting for a named external condition, such as CI or an approval. `state_reason` identifies that condition. `ready` means required evidence is valid and delivery may proceed.
+
+Entering `suspended` or `waiting` stores the exact origin in `return_state` in the same transaction as the state change and event. Leaving returns only to that stored state and clears `return_state` in the same transaction. A transition to `failed` or `cancelled` also clears it. Events may repeat this provenance for audit, but restart and resume use the aggregate field; they never infer it from an endpoint, open decision, check, delivery, event payload, or `state_reason`.
 
 Dispatch recovery is bounded. When the recorded dispatch operation exhausts its retry policy, the job moves to `failed` with `state_reason=dispatch_failed` instead of returning to `queued` again.
 
@@ -575,7 +596,8 @@ Cancelling during `dispatching` first marks the dispatch operation `cancel_reque
 preparing -> dispatched -> active -> succeeded
 dispatched|active -> blocked -> active
 blocked -> succeeded                         (terminal worker event while blocked)
-active|blocked -> suspended -> active|blocked
+active -> suspended(return_state=active) -> active
+blocked -> suspended(return_state=blocked) -> blocked
 preparing|dispatched|active|blocked|suspended -> failed
 preparing|dispatched|active|blocked|suspended -> cancelled
 dispatched|active|blocked -> lost
@@ -646,7 +668,17 @@ pending -> running -> passed|failed
 passed|failed -> invalidated     (head_sha moved)
 ```
 
-All transitions are checked in the domain layer and committed with the expected generation. A stale caller receives `state_conflict`; it does not overwrite newer state.
+### 13.8 Provider session state
+
+```text
+preparing -> active -> revoked
+preparing|active -> failed
+active -> expired
+```
+
+The local gateway rejects a capability as soon as its row leaves `active`. Suspension and terminal run transitions commit local revocation with the run change. Revoking a provider-issued run token is an external saga, but direct provider egress remains denied while that compensation finishes.
+
+All transitions are checked in the domain layer and committed with the expected generation. State and `return_state` are one compare-and-swap update, never separate writes. A stale caller receives `state_conflict`; it does not overwrite newer state.
 
 ## 14. Event and worker protocol
 
@@ -674,7 +706,7 @@ The token is:
 - short-lived and renewable while the run is `dispatched`, `active`, or `blocked`;
 - revoked when the run is suspended, ends, or is replaced.
 
-An authenticated heartbeat received before expiry extends `capability_expires_at` while the run is `dispatched`, `active`, or `blocked`, capped by the configured maximum run lifetime. A blocked run must stay renewable: a decision can wait for days, and 13.2 accepts a terminal worker event while blocked, which only an authenticated token can deliver. The heartbeat renews the existing opaque token; there is no separate renewal endpoint. An expired token cannot renew itself. Suspending a run revokes its capability; `job resume` delivers a fresh capability for the same run through the protected dispatch path before the worker continues.
+An authenticated heartbeat received before expiry extends `capability_expires_at` while the run is `dispatched`, `active`, or `blocked`, capped by the configured maximum run lifetime. A blocked run must stay renewable: a decision can wait for days, and 13.2 accepts a terminal worker event while blocked, which only an authenticated token can deliver. The heartbeat renews the existing opaque token; there is no separate renewal endpoint. An expired token cannot renew itself. Suspending a run revokes its event capability and provider session. `job resume` creates fresh run-scoped capabilities for the same run through the protected dispatch path before the worker continues.
 
 The service validates the token and writes the event and state transition before acknowledging it. A worker may retry after a lost response without creating a duplicate because every mutation carries an idempotency key.
 
@@ -719,6 +751,7 @@ The initial stable event namespace includes:
 - `project.added`, `project.changed`, `project.archived`;
 - `job.created`, `job.queued`, `job.blocked`, `job.suspended`, `job.resumed`, `job.ready`, `job.completed`, `job.failed`, `job.cancelled`, `job.archived`;
 - `run.preparing`, `run.started`, `run.progress`, `run.question`, `run.amended`, `run.suspended`, `run.resumed`, `run.completed`, `run.failed`, `run.lost`;
+- `provider_session.started`, `provider_session.revoked`, `provider_session.expired`, `provider_session.failed`;
 - `endpoint.changed`, `endpoint.missing`;
 - `decision.opened`, `decision.answered`, `decision.superseded`, `decision.expired`;
 - `check.started`, `check.passed`, `check.failed`, `check.invalidated`;
@@ -734,6 +767,12 @@ New event kinds may be added in a minor protocol version. Existing meanings must
 ### 14.4 Bash compatibility protocol
 
 During migration, the Bash adapter reads the legacy `events.jsonl` records that workers append with `crewboss emit` (`blocked` and `done`). It maps `blocked` to a free-text `run.question` and `done` to `run.completed`, using the stored legacy `crew_id` and `run_id`. The legacy `event_id` becomes the deduplication key, and the raw payload is preserved. Terminal text is never consulted for completion.
+
+The v0.3 Bash shim also participates in one legacy-home write barrier. Every registry mutation and event append takes the barrier in shared mode before it takes its existing registry or event lock. Migration inspection and rehearsal import take it exclusively only long enough to copy an immutable snapshot, then release it while the service validates or imports that copy. A final service cutover holds it exclusively through the authority switch. Rehearsal imports do not take authority and never make an earlier snapshot silently current.
+
+After cutover, the durable engine marker is authoritative over `CREWBOSS_ENGINE=bash`. Compatibility commands route to the service. Already-running Bash workers may keep using `crewboss emit`; the shim sends their stored crew/run identity and original event UUID through the service's legacy ingress instead of appending `events.jsonl`.
+
+During an interrupted cutover, normal mutating compatibility commands return `migration_in_progress`. `emit` is the exception because dropping a terminal worker event is unsafe: it first routes to the service if SQLite already records service authority; otherwise it appends the original envelope and UUID to a locked `cutover-events.jsonl` spool. It reports success only after a service acknowledgement or a durable spool append. Cutover recovery reacquires the barrier exclusively and imports every spooled UUID through normal deduplication before it completes the engine marker. This prevents either engine from accepting an untracked write and preserves at-least-once worker delivery across every cutover crash point.
 
 ## 15. Public CLI contract
 
@@ -781,7 +820,7 @@ Both `job wait` and its compatibility alias accept one or more selectors. This p
 
 `job send` delivers a free-text message to the run's worker through the harness adapter. Unlike `job answer`, it does not resolve a decision. `job diff` shows the run's recorded `base_sha..head_sha` through the worktree adapter and labels the exact SHAs.
 
-The compatibility alias `close` maps to `job suspend`. It records the job and run as suspended before safely closing the worker endpoint. The alias `open` maps to `job resume`. Resume restores the same run only when the harness adapter reports verified resume support; otherwise it returns `backend_unavailable` and recommends `job retry`. `remove` maps to `job remove`, safely cleans CrewBoss-owned runtime resources, and archives the logical job. It does not erase events, approvals, or audit evidence.
+The compatibility alias `close` maps to `job suspend`. It records the job and run as suspended, including each exact `return_state`, before safely closing the worker endpoint. The alias `open` maps to `job resume`. Resume restores the same run only when the harness adapter reports verified resume support; otherwise it returns `backend_unavailable` and recommends `job retry`. The resume saga keeps both aggregates suspended while it restores the endpoint and delivers fresh event and provider capabilities. Only after the worker acknowledges the protected resume path does one transaction restore the job and run to their respective stored states, clear both `return_state` fields, and emit the resume events. `remove` maps to `job remove`, safely cleans CrewBoss-owned runtime resources, and archives the logical job. It does not erase events, approvals, or audit evidence.
 
 `job remove` first completes normal cancellation and cleanup when needed. It sets `archived_at` only after cleanup succeeds or no owned runtime resources remain. It preserves the job's terminal state and all history.
 
@@ -934,7 +973,7 @@ Mutations require `X-CrewBoss-Request-ID`. Conditional aggregate updates use `If
 
 Socket ownership and operating-system peer identity prove only that a caller belongs to the local user account. They do not prove that the process is the operator, boss, or worker. Control requests therefore also require a role credential outside the worker sandbox. Approval grants require an operator method from 21.4, preferring an attested user-presence action over plain TTY confirmation; same-user peer credentials alone never grant approval authority.
 
-Workers do not receive the control socket. Each run receives a separate ingress socket or inherited file descriptor that exposes only worker events and heartbeat, plus its scoped bearer capability. The harness sandbox must deny the control socket, SQLite state, configuration, other run directories, and boss or operator credentials. No API accepts a caller role from an untrusted request body.
+Workers do not receive the control socket. Each run receives a separate event ingress socket or inherited file descriptor that exposes only worker events and heartbeat, plus its scoped event capability. A second run-specific ingress may expose only the provider gateway described in 21.2, with a separate run-scoped provider capability. Neither capability grants the other protocol. The harness sandbox must deny the control socket, SQLite state, configuration, other run directories, upstream provider credentials, and boss or operator credentials. No API accepts a caller role from an untrusted request body.
 
 ## 16. Job types and brief creation
 
@@ -1037,10 +1076,11 @@ Dispatch is a recorded saga:
 3. reserve branch and worktree names;
 4. create the worktree;
 5. create the session endpoint;
-6. start the selected harness;
-7. deliver the brief and capability;
-8. receive the worker's first authenticated heartbeat as the protocol acknowledgement;
-9. mark the run active.
+6. create a revocable provider session without exposing the upstream credential;
+7. start the selected harness with the run-scoped event and provider ingresses;
+8. deliver the brief and event capability;
+9. receive the worker's first authenticated heartbeat as the protocol acknowledgement;
+10. mark the run active.
 
 Every completed step is recorded. If a later step fails, the service either compensates safely or leaves a visible recoverable operation. It never forgets an orphaned worktree or pane.
 
@@ -1052,6 +1092,7 @@ Cleanup checks:
 - no uncommitted or untracked user work would be lost;
 - delivery evidence is stored;
 - no other active lease references the endpoint or worktree;
+- the run's event and provider capabilities are revoked;
 - branch deletion matches policy.
 
 A force cleanup needs exact targets and operator approval. Cleanup reports what was removed and whether recovery remains possible.
@@ -1105,7 +1146,7 @@ Required operations:
 - `RequestStop`
 - `Version`
 
-Each adapter declares support for resume, non-interactive input, structured hooks, permission controls, model selection, reasoning-effort selection, and worker filesystem isolation. CrewBoss must not claim a capability that has not passed a live test.
+Each adapter declares support for resume, non-interactive input, structured hooks, permission controls, model selection, reasoning-effort selection, worker filesystem isolation, provider endpoint override, and provider authentication mode. CrewBoss must not claim a capability that has not passed a live test.
 
 Claude is the reference harness for v0.5 dispatch and isolation. Claude and Codex are required for 1.0. OpenCode is the next supported harness. Additional harnesses use the same contract.
 
@@ -1114,6 +1155,8 @@ Claude is the reference harness for v0.5 dispatch and isolation. Claude and Code
 Required operations:
 
 - `Probe`
+- `ReadRemoteRef`
+- `PublishHead`
 - `FindOrCreatePullRequest`
 - `ReadChecks`
 - `ReadReviews`
@@ -1123,11 +1166,15 @@ Required operations:
 
 GitHub through `gh` is the reference adapter. GitLab follows after the GitHub contract is stable.
 
+`PublishHead` receives the canonical repository, local worktree, expected local `head_sha`, one service-owned `source_ref`, and the nullable expected remote SHA from `deliveries.published_sha`. It first proves the worktree resolves to `head_sha`, then observes the remote ref. A missing ref is created only when the expected remote SHA is null. A ref already at `head_sha` is an idempotent success. A ref at the expected remote SHA may advance with a non-force fast-forward to a newly verified `head_sha`. Any other value returns `state_conflict`; the adapter never force-pushes, deletes, or silently chooses another ref. Those actions require a new exact operation and the approval required by 21.3. The recorded observation includes the remote identity, ref, before SHA, after SHA, and provider request identifier when available. The service updates `published_sha` only if the delivery generation and `head_sha` are still current.
+
+`FindOrCreatePullRequest` requires `source_ref` and `expected_head_sha`. Before returning an existing or new PR, it proves both the remote source ref and the forge's PR head resolve to that SHA. A moved ref or a PR associated with another head is a conflict, not an idempotent match.
+
 ### 19.5 Capability negotiation
 
 Every adapter returns a versioned capability document. A workflow fails before side effects if required capabilities are missing. Experimental support appears in `doctor` and JSON output; it is never described as verified support.
 
-Harness capability documents report `worker_isolation` as `enforced`, `advisory`, or `none`. `enforced` requires a live conformance probe proving that the worker cannot open the control socket, state database, config, boss credentials, or another run directory, and cannot reach a network destination outside its profile's egress allowlist in 21.2, while it can still use its own worktree, event ingress, and egress proxy. `doctor` runs this probe for every supported harness and profile. A version change invalidates the cached result until the probe passes again.
+Harness capability documents report `worker_isolation` as `enforced`, `advisory`, or `none`, and `provider_auth` as `brokered`, `provider_run_scoped`, or `host_inherited`. `enforced` requires a live conformance probe proving that the worker cannot open the control socket, state database, config, upstream provider or boss credentials, or another run directory, and cannot reach a network destination outside its profile's egress allowlist in 21.2, while it can still use its own worktree and run-scoped ingresses. An enforced profile requires `brokered` or a provider-issued token that is independently proved short-lived, run-scoped, revocable, and unable to mint another credential. `host_inherited` always makes `worker_isolation=none`. `doctor` runs this probe for every supported harness and profile. A harness or provider-auth adapter version change invalidates the cached result until the probe passes again.
 
 ## 20. Supervision, wake-up, and recovery
 
@@ -1176,6 +1223,8 @@ At startup the service:
 7. resumes pending external operations by idempotency key;
 8. emits one reconciliation summary.
 
+Reconciliation preserves a persisted `return_state` while an aggregate remains suspended or waiting. It does not use live observations or related rows to choose a destination. A pending resume or external-wait operation must complete its recorded checks before the domain transition consumes that field.
+
 It never infers success only because an endpoint exited or a branch exists.
 
 ### 20.5 Away and autonomous modes
@@ -1208,18 +1257,22 @@ Each action records its actor and effective authority.
 
 | Profile | Intended behavior |
 | --- | --- |
-| `safe` | Use an enforced sandbox to read allowed repository data and prepare plans or reports. No source mutation or network delivery. |
+| `safe` | Use an enforced sandbox to read allowed repository data and prepare plans or reports. No source mutation, forge delivery, or general network egress; model traffic uses only the provider gateway. |
 | `standard` | Use an enforced sandbox and isolated worktree, run declared checks, and prepare delivery. Merge and destructive cleanup need approval. |
 | `autonomous` | Use an enforced sandbox to perform pre-approved project actions, including selected delivery operations, within exact policy limits. |
 | `unsafe-host` | Run without a verified same-user isolation boundary. Intended only for controlled environments. Requires explicit operator activation and expires. |
 
 No harness receives a dangerous bypass flag merely because it is installed. The harness adapter translates a CrewBoss permission profile to supported vendor controls and reports any gap.
 
-`safe`, `standard`, and `autonomous` require `worker_isolation=enforced`. Their sandbox denies the CrewBoss control socket, state and configuration roots, operator and boss credentials, unrelated worktrees, and other run directories. It exposes only the run's worktree, declared tool paths, and per-run event ingress. Dispatch fails closed if any required denial cannot be proved.
+`safe`, `standard`, and `autonomous` require `worker_isolation=enforced`. Their sandbox denies the CrewBoss control socket, state and configuration roots, upstream provider credentials, operator and boss credentials, unrelated worktrees, and other run directories. It exposes only the run's worktree, declared tool paths, event ingress, provider-gateway ingress, and general egress proxy. Dispatch fails closed if any required denial cannot be proved.
 
-Enforcement comes from a deny-by-default filesystem sandbox that the service applies when it launches the harness, not from the harness's own permission prompts. The reference mechanisms are Seatbelt (`sandbox-exec`) on macOS and a Linux user namespace with bind mounts. Each allows only the run's worktree, the run's ingress socket and spool directory, and the declared tool paths, and denies everything else. A harness the service cannot launch inside one of these reports `worker_isolation=none`, whatever its own permission features are.
+Enforcement comes from a deny-by-default filesystem sandbox that the service applies when it launches the harness, not from the harness's own permission prompts. The reference mechanisms are Seatbelt (`sandbox-exec`) on macOS and a Linux user namespace with bind mounts. Each allows only the run's worktree, run-specific ingress sockets and spool directory, the general egress proxy, and the declared tool paths, and denies everything else. A harness the service cannot launch inside one of these reports `worker_isolation=none`, whatever its own permission features are.
 
-Isolation constrains the network as well as the filesystem, because a harness needs model-provider connectivity while hostile repository code must not get free egress. The sandbox denies direct outbound network and exposes one service-owned local egress proxy next to the event ingress. The proxy enforces a per-profile host allowlist: `safe` allows only the harness's declared model-provider hosts, `standard` and `autonomous` add the hosts named in the project's `policy_json`, such as a package registry, and `unsafe-host` is unrestricted. The `safe` promise of no network delivery is this allowlist. The 19.5 conformance probe must show that a direct connection and a disallowed proxied host both fail, or the harness reports `worker_isolation=none`.
+Isolation constrains the network as well as the filesystem, because a harness needs model-provider connectivity while hostile repository code must not get free egress. The sandbox denies direct outbound network and exposes service-owned local gateways next to the event ingress. A general egress proxy enforces a per-profile host allowlist: `safe` permits no arbitrary external destination, `standard` and `autonomous` add only the hosts named in the project's `policy_json`, such as a package registry, and `unsafe-host` is unrestricted. For `safe`, model requests through the provider gateway are the only disclosed external data flow; they do not authorize package, forge, or arbitrary host access. The 19.5 conformance probe must show that a direct connection and a disallowed proxied host both fail, or the harness reports `worker_isolation=none`.
+
+Model traffic uses a separate provider gateway outside the worker sandbox. The service reads the upstream API key, OAuth refresh token, or harness account credential from an operator-configured OS credential store or protected service credential source. It never mounts or copies that credential into the harness environment, filesystem, process namespace, database, or run artifacts. The worker receives only a short-lived capability bound to one run, harness, provider, model policy, and expiry. The gateway validates that capability, applies configured usage limits, adds the upstream credential, forwards only the model protocol, redacts authentication data from logs, and revokes the session when the run suspends or ends.
+
+An enforced harness must support a verified provider endpoint override or a provider-issued run-scoped credential with equivalent properties. Its command sandbox must also prevent a child command from reading the harness process memory, environment, inherited descriptors, or another process namespace. If either condition cannot be proved for the installed harness and authentication mode, `provider_auth=host_inherited`, `worker_isolation=none`, and safe profiles fail closed. Subscription or browser-login credentials that cannot be mediated are therefore available only through explicitly approved `unsafe-host`; CrewBoss does not relabel them as safe.
 
 `crewboss init` and `crewboss doctor` run the isolation probe and record the result. If no supported profile can prove enforcement on this machine, `init` leaves `permission_profile = "standard"` and prints the exact `unsafe-host` activation command. Dispatch then fails with `policy_refused` and repeats that instruction. CrewBoss never lowers the configured profile on its own.
 
@@ -1256,8 +1309,9 @@ Repository files, issue text, worker output, and pull-request comments are untru
 - Paths are resolved and checked against allowed roots.
 - Symlink traversal is checked before writes and cleanup.
 - Logs redact registered secrets and capabilities.
-- Enforced worker sandboxes cannot open the control socket, state database, config, or another run's files.
-- The per-run ingress exposes only heartbeat and worker event actions; its token cannot call boss, approval, configuration, or delivery APIs.
+- Enforced worker sandboxes cannot open the control socket, state database, config, upstream provider credentials, or another run's files.
+- The event ingress exposes only heartbeat and worker event actions; its token cannot call boss, approval, configuration, provider, or delivery APIs.
+- The provider ingress accepts only its separate run-scoped capability and model protocol; it cannot call CrewBoss APIs or reveal, refresh, or export the upstream credential.
 - Direct database access is a trusted service operation. File mode `0600` protects against other OS users, not another process with the same UID.
 - Forge comments cannot change authority without operator confirmation.
 
@@ -1304,15 +1358,21 @@ The default robust pipeline is:
 3. run project checks;
 4. run configured review checks in parallel;
 5. resolve required findings or record accepted exceptions;
-6. create or update the PR idempotently;
-7. wait for required CI and review state;
-8. confirm head SHA has not changed;
-9. obtain merge approval when policy requires it;
-10. merge through the forge adapter;
-11. store delivery evidence;
-12. clean up owned resources safely.
+6. reserve a unique service-owned remote source ref and record a publish operation;
+7. publish `head_sha` without force and observe the remote ref at that exact SHA;
+8. create or update the PR idempotently with that ref and expected SHA;
+9. wait for required CI and review state;
+10. confirm the local head, remote source ref, and PR head still equal `head_sha`;
+11. obtain merge approval when policy requires it;
+12. merge through the forge adapter;
+13. store delivery evidence, including the remote ref observations;
+14. clean up owned resources safely.
 
 Red required checks are never merged. A review exception must be a named, scoped approval record.
+
+A configured forge target may allow the non-force creation of the job's reserved source ref under `standard` policy. Publishing to another remote or ref is outside the recorded delivery target and requires approval under 21.3. A retry always observes the ref before pushing; it never assumes a failed response means the push did not happen.
+
+`direct-pr` uses the same source-ref reservation, revision-pinned publication, PR identity, and drift checks. It skips only the additional review pipeline that distinguishes `verified-pr`; it never skips revision binding.
 
 ### 22.4 Local delivery
 
@@ -1404,11 +1464,13 @@ The old commands remain supported through the full 1.x release line. They may be
 The migration tool reads, without modifying:
 
 - the `crew.json` registry, both the captured v0.2 fixture format and the final v0.3 format with project identity;
-- the merged PR #2 `events.jsonl` and `event-state.json` formats;
+- the merged PR #2 `events.jsonl` and `event-state.json` formats, plus the final v0.3 event-state revision;
 - known CrewBoss-owned Worktrunk worktrees;
 - known Herdr endpoints.
 
-`migrate inspect` produces an import plan and conflicts. `migrate apply` first creates a timestamped backup, then imports records in one database transaction. In v0.4 imported endpoints and worktrees are recorded in the `unknown` state, because no adapter exists yet to observe them; the v0.5 adapters reconcile them through the normal 13.3 path. Reconciliation against live external resources is therefore a v0.5 behavior, not a v0.4 promise.
+`migrate inspect` produces an import plan and conflicts. A normal `migrate apply` is a rehearsal import: it first creates a timestamped backup, copies one stable legacy snapshot under the write barrier, then imports records and its `legacy_import_checkpoints` row in one database transaction after releasing the barrier. The snapshot records the Bash registry revision and hash, the last complete event sequence and record hash, and the event-state revision and hash. Repeating the same checkpoint returns the stored result. A newer checkpoint updates imported non-authoritative records by stable legacy crew, run, and event identities without duplicating them. Registry revision, event sequence, and event-state revision must each be nondecreasing, and at least one must advance for a new checkpoint. If a revision is unchanged, its hash must also be unchanged. A lower coordinate, a changed event below the event high-water mark, or an equal coordinate with a different hash fails with `state_conflict`.
+
+In v0.4 imported endpoints and worktrees are recorded in the `unknown` state, because no adapter exists yet to observe them; the v0.5 adapters reconcile them through the normal 13.3 path. Reconciliation against live external resources is therefore a v0.5 behavior, not a v0.4 promise. A rehearsal import never changes which engine may write.
 
 ### 25.3 Mapping
 
@@ -1417,7 +1479,7 @@ The migration tool reads, without modifying:
 - old `task` and latest prompt -> job objective and run amendment history;
 - old blocked/done event -> durable event with imported source metadata;
 - old `event-state.json` cursor and pending map -> `legacy` consumer cursor and parked events;
-- old closed crew -> terminal endpoint plus preserved job/run state.
+- old closed crew -> terminal endpoint plus preserved job/run state; a closed running or blocked crew imports as suspended with `return_state=active` or `blocked`, respectively.
 
 An ambiguous repository or name is not guessed. It becomes an import conflict with a suggested command.
 
@@ -1425,11 +1487,26 @@ An ambiguous repository or name is not guessed. It becomes an import conflict wi
 
 During the bridge release:
 
-- `CREWBOSS_ENGINE=bash` selects the old implementation;
-- `CREWBOSS_ENGINE=service` selects the new implementation;
+- before final cutover, `CREWBOSS_ENGINE=bash` selects the old implementation;
+- before final cutover, `CREWBOSS_ENGINE=service` selects the new implementation for the release's allowed rehearsal and contract-test surface;
 - the default changes only after the service implements every compatibility command and the contract, migration, and live dispatch tests pass, which is v0.5 at the earliest;
 - the Bash engine is frozen as a rollback path and does not implement `crewboss.cli.v1`;
 - rollback keeps the pre-migration backup and does not pretend new service state can always be represented by the old registry.
+
+The final handoff is `migrate apply --cutover`. It is a recorded saga with this order:
+
+1. record the cutover operation and set the checkpoint to `cutover_pending`; this state alone does not stop Bash writes;
+2. acquire the legacy-home write barrier exclusively;
+3. create and fsync a `cutover-in-progress` marker that makes every Bash mutation fail closed after a crash;
+4. capture the registry revision and hash, the last complete event sequence and hash, the event-state revision and hash, and any existing cutover-event spool while no legacy writer can advance them;
+5. import through those exact high-water marks, deduplicate every spooled UUID, and commit the domain rows, legacy checkpoint including the spool hash, audit entry, and `service_authoritative` authority state in one SQLite transaction;
+6. prove every spooled UUID is committed and no unobserved spool record remains;
+7. atomically replace the in-progress marker with the service-engine marker;
+8. release the barrier and route compatibility commands and legacy worker events to the service.
+
+Recovery observes before acting. A crash while only `cutover_pending` is recorded leaves Bash authoritative; recovery takes a new snapshot instead of trusting the earlier plan. After the in-progress marker exists, a pre-commit recovery may remove it and reopen Bash only when the database is still at the previous rehearsal checkpoint and the cutover-event spool is empty. The presence of any spooled UUID makes recovery forward-only: it reacquires the barrier, imports every spooled event through normal deduplication, commits service authority, and completes the service marker. A crash after commit follows the same forward path for any event spooled before recovery reacquired the barrier. No recovery path reopens Bash with a preserved but unconsumed spool. The cutover command verifies that a fresh legacy snapshot has the committed registry revision, event high-water mark, event-state revision, hashes, and no uncommitted spool UUID before it reports success.
+
+`CREWBOSS_ENGINE=bash` cannot override a `cutover-in-progress` or service-authoritative marker. The rollback engine may write only in a restored pre-cutover home. After any service-only mutation, rollback means restoring that backup with an explicit loss summary or moving forward; it is never an implicit engine toggle.
 
 ## 26. Incremental roadmap
 
@@ -1471,6 +1548,7 @@ Each release is independently releasable. Reliability gates are mandatory even w
 - no hard-coded unsafe harness mode;
 - `doctor` with adapter and version checks;
 - explicit labels for pane snapshots;
+- monotonic registry and event-state revisions, plus the shared legacy-home write barrier used by registry mutations, event append, and event-state checkpoints;
 - frozen behavior and naming fixtures for the rollback engine;
 - refreshed migration fixtures for the v0.3 registry format, since project identity changes the schema the v0.2 fixtures captured.
 
@@ -1485,6 +1563,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - injected failures at every spawn step leave either no resource or a recorded recoverable resource;
 - live Herdr and Worktrunk smoke tests pass;
 - dangerous harness permissions require explicit configuration;
+- concurrent registry, event, and event-state writers stop behind an exclusive cutover barrier, and a durable in-progress marker makes later Bash mutations fail closed;
 - the Bash engine has no new JSON envelope or idempotency implementation;
 - frozen rollback and naming fixtures pass.
 
@@ -1498,6 +1577,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - XDG home layout and owner-only permissions;
 - SQLite migrations and WAL configuration through `modernc.org/sqlite`;
 - core projects, jobs, runs, endpoints, events, consumer cursors with parked events, requests, operations, leases, approvals, and audit tables;
+- legacy import checkpoints with registry and event high-water marks;
 - transactional domain state changes;
 - idempotent command API;
 - the only implementation of `crewboss.cli.v1`, stable exit codes, and `--request-id`;
@@ -1515,6 +1595,8 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - frozen Bash regression tests pass for the rollback engine without requiring v1 JSON output;
 - `crewboss.cli.v1` fixtures pass against the Go engine only;
 - current main migration fixtures import without data loss;
+- closed running and blocked fixtures import with `return_state=active` and `blocked`, respectively, and remain deterministic after restart;
+- repeated rehearsal imports are idempotent, reject rewritten history below their high-water mark, and do not change engine authority;
 - killing the service between external saga steps recovers safely;
 - 100 concurrent event writes have unique ordered sequences and no loss;
 - stale generations cannot overwrite new state;
@@ -1537,10 +1619,11 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - deterministic scheduler and concurrency limits;
 - dispatch saga with worktree and endpoint recovery;
 - Herdr session and Claude harness adapters sufficient for reference dispatch;
-- explicit worker event commands, per-run ingress, and scoped capabilities;
-- the section 14.4 legacy event bridge, so Bash-spawned workers stay supervised while both engines coexist;
+- explicit worker event commands, separate event and provider ingresses, and scoped capabilities;
+- a service-owned provider gateway and revocable run-scoped provider sessions for the reference Claude harness;
+- the section 14.4 legacy bridge and cutover routing, so Bash-spawned workers stay supervised while both engines coexist and after service authority begins;
 - an isolation conformance probe for the reference Claude harness and every supported safe profile;
-- enforced worker isolation, including the egress proxy and allowlist, for `safe`, `standard`, and `autonomous` profiles;
+- enforced worker isolation, including the provider gateway, general egress proxy, and allowlist, for `safe`, `standard`, and `autonomous` profiles;
 - minimal approval request, grant, deny, expiry, and single-use consumption workflows for `unsafe-host` and later live boss-lease takeover;
 - Explore reports and promotion to Build;
 - project, job, diff, logs, and report commands.
@@ -1553,13 +1636,18 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - dependency order is stable and explainable;
 - a worker retry cannot duplicate completion or a question;
 - Herdr and Claude complete the reference Build and Explore dispatch contract;
-- with `worker_isolation=enforced`, a worker cannot open the control socket, state database, config, credentials, or another run's files, and cannot reach a network destination outside its profile's egress allowlist;
+- with `worker_isolation=enforced`, Claude completes a real model turn through the provider gateway while the worker cannot recover or use the upstream credential, open the control socket, state database, config, or another run's files, or reach a network destination outside its profile's egress allowlist;
+- suspending or ending the run revokes its provider session, and replaying the run-scoped capability cannot create another session or reach the provider;
 - without enforced isolation, safe profiles refuse dispatch and only explicitly approved `unsafe-host` is available;
 - an `unsafe-host` approval is exact, expiring, consumed once, and cannot authorize another action;
 - Explore cannot enter code delivery;
+- suspending once from `active` and once from `blocked`, restarting the service, and resuming returns each job and run only to its recorded state;
 - promotion begins from a clean current base;
 - no coordinator write occurs in a primary checkout;
-- every failed dispatch step is reconciled or safely compensated.
+- every failed dispatch step is reconciled or safely compensated;
+- writes raced immediately before cutover are present in SQLite, writes attempted during cutover fail closed or retry, and compatibility writes after cutover reach only the service;
+- killing `migrate apply --cutover` before its SQLite commit with an empty spool may reopen Bash; repeating the crash with a spooled terminal event must finish forward to service authority and commit exactly one copy of that event;
+- killing cutover after its SQLite commit, then advancing the legacy event checkpoint and emitting a terminal event, recovers service authority with the same registry revision, event high-water mark, and event-state revision and exactly one copy of that event.
 
 ### v0.6: Always-on supervision
 
@@ -1586,6 +1674,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - an expired old boss cannot acknowledge events after takeover;
 - kill and restart the service, boss endpoint, and one worker endpoint in separate tests;
 - each recovery produces one clear state and no false success;
+- restart during a resume saga leaves the aggregates suspended until capability delivery succeeds, then consumes each stored return state exactly once;
 - a one-hour idle-fleet soak records every child process launch and outbound request, with no harness launch and zero requests to a model provider;
 - blocked questions remain queued for at least seven days or configured retention;
 - supervisor retries are bounded and visible.
@@ -1601,7 +1690,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 - revision-bound local verification;
 - `verified-pr`, `direct-pr`, `local`, and `report` modes;
 - GitHub/`gh` forge adapter;
-- PR creation/update, CI wait, review status, and merge;
+- revision-pinned remote publication, PR creation/update, CI wait, review status, and merge;
 - review checks and finding resolution;
 - local merge with branch-drift protection;
 - safe cleanup and delivery report.
@@ -1611,13 +1700,17 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 **Acceptance gate:**
 
 - changing HEAD invalidates every earlier passing check;
+- publishing creates or fast-forwards only the reserved source ref from its recorded `published_sha`, and its observed remote SHA equals the newly verified `head_sha` before PR creation;
+- a lost publish response retries idempotently, while a concurrently moved source ref returns `state_conflict` without force-pushing;
 - retrying PR creation returns the same PR;
+- PR creation refuses a forge-reported head that differs from the recorded `published_sha`;
 - red required CI cannot be merged;
 - protected merge without approval returns exit code 5;
 - a consumed approval cannot authorize a second different merge;
 - local target movement forces re-verification;
+- restart while waiting once from `verifying` and once from `ready` returns each job only to its stored state when the named condition resolves;
 - cleanup refuses dirty or unowned resources;
-- delivery evidence identifies exact base and head SHAs.
+- delivery evidence identifies the exact base SHA, local head SHA, source ref, published SHA, and forge-reported PR head SHA.
 
 ### v0.8: Crew Leads and fleet routing
 
@@ -1666,6 +1759,7 @@ This release fixes Bash safety and repository-scoping defects only. It does not 
 
 - the same Build and Explore contract passes on Herdr and Tmux;
 - Claude and Codex both complete the explicit worker protocol live tests;
+- Claude and Codex each complete a model turn through a verified brokered or provider-issued run-scoped session without exposing an upstream credential;
 - unavailable resume or permission features are reported before dispatch;
 - `doctor` proves each supported safe profile denies control and state paths before it reports `worker_isolation=enforced`;
 - autonomous mode cannot merge or perform destructive cleanup beyond its exact grant;
@@ -1738,7 +1832,7 @@ Release candidates must pass this reproducible scenario on a clean machine:
 4. Create at least ten jobs with mixed priorities and dependencies.
 5. Dispatch concurrent workers through both Herdr and Tmux.
 6. Run at least one worker with Claude and one with Codex.
-7. Complete one Build job through `verified-pr`.
+7. Complete one Build job through `verified-pr` and prove its local head, published source ref, and PR head are the same verified SHA.
 8. Complete one Build job through `local` delivery.
 9. Complete one Explore report and promote it to a new Build job.
 10. Route jobs through at least two Crew Leads.
@@ -1747,7 +1841,7 @@ Release candidates must pass this reproducible scenario on a clean machine:
 13. Remove one worker endpoint during active work and reconcile it without false success.
 14. Change a branch after verification and prove that delivery is invalidated.
 15. Attempt an unapproved merge and destructive cleanup and prove both are refused.
-16. Run a same-user worker probe that attempts to open the control socket, state database, operator credentials, another run, and a network destination outside its egress allowlist; every safe profile must deny it.
+16. Run a same-user worker probe that attempts to open the control socket, state database, operator and upstream provider credentials, harness process state, another run, and a network destination outside its egress allowlist; every safe profile must deny it while one permitted model turn through the provider gateway succeeds.
 17. Restart the terminal backend and recover owned endpoints where the adapter supports it.
 18. Finish all work and prove safe cleanup of owned worktrees, endpoints, leases, and capabilities.
 
@@ -1768,7 +1862,7 @@ Pass conditions:
 
 **Unit tests** cover names, configuration, policies, state transitions, brief validation, scheduling, and adapter error normalization.
 
-**Property tests** generate transition sequences, dependency graphs, duplicate events, stale generations, and idempotent request retries.
+**Property tests** generate transition sequences, suspended and waiting return-state pairs, dependency graphs, duplicate events, stale generations, and idempotent request retries.
 
 **Store tests** use real SQLite files and test migrations, constraints, concurrent reads, crash recovery, and WAL checkpoints.
 
@@ -1780,7 +1874,7 @@ Pass conditions:
 
 **Fault-injection tests** stop processes, delay responses, duplicate calls, move branches, remove panes, lock files, and interrupt external operations at each recorded step.
 
-**Security tests** cover path traversal, symlink changes, shell injection, malicious repository instructions, token scope, approval replay, socket ownership, and log redaction.
+**Security tests** cover path traversal, symlink changes, shell injection, malicious repository instructions, event and provider token scope, provider credential recovery attempts, approval replay, socket ownership, and log redaction.
 
 **Live tests** run supported combinations of Herdr, Tmux, Worktrunk, Claude, Codex, GitHub, and GitLab where credentials and binaries are available.
 
@@ -1874,7 +1968,7 @@ Metrics are available locally through `crewboss status --json` and a disabled-by
 
 **Risk:** Unix peer credentials authenticate a user ID, not an agent role. Without a sandbox, a hostile worker running under the operator's UID can reach user-owned files, copy credentials, open SQLite directly, or call the control socket as the same user.
 
-**Decision:** Role-isolation claims require a live-tested harness sandbox that denies control, state, configuration, credential, and unrelated run paths. Workers receive only a per-run event ingress. Safe profiles fail closed without this capability. `unsafe-host` remains available through explicit expiring approval, but its policy is not described as a security boundary against hostile same-UID code.
+**Decision:** Role-isolation claims require a live-tested harness sandbox that denies control, state, configuration, upstream credentials, process inspection, and unrelated run paths. Workers receive separate run-scoped event and provider ingresses. Upstream model credentials remain in the service-owned provider gateway; a harness that cannot use brokered or provider-issued run-scoped authentication has `worker_isolation=none`. Safe profiles fail closed without these capabilities. `unsafe-host` remains available through explicit expiring approval, but its policy is not described as a security boundary against hostile same-UID code.
 
 ### 31.9 The sandbox mechanism is platform-specific and not guaranteed
 
