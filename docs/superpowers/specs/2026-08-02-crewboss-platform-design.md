@@ -326,7 +326,7 @@ The full product should support:
 - `go install` for developers;
 - `crewboss skill install --target codex|claude|agents` for the agent instructions.
 
-The existing `npx skills add AhmedDaraz-Ignite/crewboss` flow remains a skill-only installation path. If the binary is absent, the skill prints exact binary installation instructions. It must not silently download and execute a binary.
+The existing `npx skills add arDaraz/crewboss` flow remains a skill-only installation path. If the binary is absent, the skill prints exact binary installation instructions. It must not silently download and execute a binary.
 
 Release CI publishes platform archives and a SHA-256 checksum manifest. It signs the manifest with Sigstore keyless signing through GitHub Actions OIDC. Verification pins the expected repository, workflow identity, and OIDC issuer. macOS binaries also use Apple Developer ID signing and notarization. Homebrew formulas pin the archive checksum. The self-update path verifies the same identity, signature, and checksum before it offers installation.
 

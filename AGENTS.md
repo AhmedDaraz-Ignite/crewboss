@@ -7,7 +7,7 @@ in this repository. `CLAUDE.md` is a symlink to it.
 
 crewboss is a small Bash tool published as an **agent skill**, not an application. There is no
 build, no package manager, no dependency tree. The whole product is `SKILL.md` (what an agent reads)
-plus `scripts/` (what it runs). Users install it with `npx skills add AhmedDaraz-Ignite/crewboss`,
+plus `scripts/` (what it runs). Users install it with `npx skills add arDaraz/crewboss`,
 which copies this repo into `.claude/skills/` or `.agents/skills/`.
 
 Consequence: `SKILL.md` is a shipped interface, equal in weight to the code. Any change to a command,
