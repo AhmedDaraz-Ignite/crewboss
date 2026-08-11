@@ -47,13 +47,13 @@ When several crews are planned, spawn them all before waiting. Then use one bloc
 This teaches your AI agent (Claude Code, Codex, and others) how to use crewboss:
 
 ```bash
-npx skills add AhmedDaraz-Ignite/crewboss
+npx skills add arDaraz/crewboss
 ```
 
 To install for one agent only:
 
 ```bash
-npx skills add AhmedDaraz-Ignite/crewboss --agent claude-code
+npx skills add arDaraz/crewboss --agent claude-code
 ```
 
 Or for all agents on your machine: `--agent '*'`.
@@ -89,7 +89,7 @@ next to it.
 If you want to type the commands yourself:
 
 ```bash
-git clone https://github.com/AhmedDaraz-Ignite/crewboss
+git clone https://github.com/arDaraz/crewboss
 ln -s "$PWD/crewboss/scripts/crewboss" ~/bin/crewboss   # or any folder on your PATH
 ```
 
